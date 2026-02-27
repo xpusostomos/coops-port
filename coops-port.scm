@@ -1,4 +1,32 @@
-(import coops srfi-4 (chicken base) (chicken port) (chicken memory))
+(module coops-port (
+<port> <input-port> <output-port> <binary-port>
+     <binary-input-port> <binary-output-port>
+     close closed? get-position set-position! 
+     available flush! read! write! read-byte! write-byte!
+     
+     ;; Constants
+     whence/beginning whence/current whence/end
+     
+     ;; Bytevector Implementation
+     <bytevector-port> <bytevector-input-port> <bytevector-output-port>
+     <bytevector-dynamic-output-port>
+     make-bytevector-input-port
+     make-bytevector-output-port
+     make-bytevector-dynamic-output-port
+     reset-input-data!
+     truncate!
+     get-output-u8vector
+     get-data-length
+     get-buffer-capacity
+     set-buffer-capacity!
+     
+     ;; Buffered Decorators
+     <buffered-port> <buffered-input-port> <buffered-output-port>
+     make-buffered-input-port
+     make-buffered-output-port
+     fill!)				   
+
+(import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory))
 
 (define-class <port> ()
   ((chicken-port)
@@ -58,9 +86,9 @@ If position is not an integer, whence is ignored and the stream is restored stat
 
 (define-class <output-port> (<port>))
 
-(define-generic (flush port))
+(define-generic (flush! port))
 
-(define-method (flush (port <output-port>))
+(define-method (flush! (port <output-port>))
   (void))
 
 (define-class <textual-port> (<port>))
@@ -78,9 +106,8 @@ If position is not an integer, whence is ignored and the stream is restored stat
 
 
 (define-method (read-byte! (port <binary-input-port>))
-  (let ((bv (slot-value port 'buffer)))
+  (let* ((bv (make-u8vector 1 0)))
     (if (= (read! port bv 0 1) 1)
-;    (if (= (read! port bv) 1)
         (u8vector-ref bv 0)
         #!eof)))
 
@@ -98,21 +125,16 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 	(@to "exact integer"))
   )
 
-(define-generic (write-byte port byte)
+(define-generic (write-byte! port byte)
   @("writes the byte to the output stream"
 	(@to "undefined")))
 
-(define-method (write-byte (port <binary-output-port>) byte)
-  (let ((bv (slot-value port 'buffer)))
+(define-method (write-byte! (port <binary-output-port>) byte)
+  (let* ((bv (make-u8vector 1 0)))
     (u8vector-set! bv 0 byte)
     (write! port bv 0 1)
     (void)))
 
-(define-class <buffered-port> (<port>))
-
-(define-class <buffered-input-port> (<input-port> <buffered-port>))
-
-(define-class <buffered-output-port> (<output-port> <buffered-port>))
 
 (define-class <bytevector-port> (<binary-input-port>)
   ((start initform: 0)
@@ -134,23 +156,34 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           'size  end
           'limit end)))
 
+(define-method (reset-input-data! (port <bytevector-input-port>) data #!optional (start 0) (count #f))
+ (let* ((data-len (u8vector-length data))
+         (actual-count (or count (- data-len start)))
+         (end (+ start actual-count)))
+   (set! (slot-value port 'data) data)
+   (set! (slot-value port 'start) start)
+   (set! (slot-value port 'offset) start)
+   (set! (slot-value port 'size) end)
+   (set! (slot-value port 'limit) end)))
+ 
 (define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
   (let* ((data (slot-value port 'data))
-         (p (slot-value port 'offset))
+         (offset (slot-value port 'offset))
          ;; The hard wall of the sandbox
-         (boundary (slot-value port 'limit)) 
-         
+         (limit (slot-value port 'limit)) 
          (requested (or count (- (u8vector-length bytevector) start)))
-         
-         ;; We can read all the way to the 'limit', 
-         ;; regardless of the 'size' high-water mark.
-         (available (- boundary p))
-         (to-copy (min requested (max 0 available))))
-    
-    (move-memory! data bytevector to-copy p start)
-    (set! (slot-value port 'offset) (+ p to-copy))
-    
+         (to-copy (min requested (max 0 (available port)))))
+    (move-memory! data bytevector to-copy offset start)
+    (set! (slot-value port 'offset) (+ offset to-copy))
     to-copy))
+
+(define-method (read-byte! (port <bytevector-input-port>))
+  (let ((offset (slot-value port 'offset)))
+	(if (< offset (slot-value port 'size))
+		(begin
+		  (set! (slot-value port 'offset) (+ offset 1))
+		  (u8vector-ref (slot-value port 'data) offset))
+        #!eof)))
 
 (define-method (available (port <bytevector-port>))
   (max 0 (- (slot-value port 'size) (slot-value port 'offset))))
@@ -196,8 +229,8 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     ;; 1. Prepare the sandbox (Dynamic: grows 'limit'; Fixed: does nothing)
     (ensure-capacity! port (+ p requested))
     
-    (let* ((boundary (slot-value port 'limit))
-           (to-write (min requested (max 0 (- boundary p)))))
+    (let* ((limit (slot-value port 'limit))
+           (to-write (min requested (max 0 (- limit p)))))
       
       (move-memory! bytevector (slot-value port 'data) to-write start p)
       
@@ -209,6 +242,17 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (set! (slot-value port 'size) (slot-value port 'offset)))
         
       to-write)))
+
+(define-method (write-byte! (port <bytevector-output-port>) byte)
+  (let ((offset (slot-value port 'offset)))
+	(ensure-capacity! port (+ offset 1))
+	(if (< offset (slot-value port 'limit))
+		(begin
+		  (u8vector-set! (slot-value port 'data) offset byte)
+		  (set! (slot-value port 'offset) (+ offset 1))
+		  (when (> (slot-value port 'offset) (slot-value port 'size))
+			(set! (slot-value port 'size) (slot-value port 'offset)))))))
+
 
 (define-generic (ensure-capacity! port req))
 
@@ -235,7 +279,9 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define-class <bytevector-dynamic-output-port> (<bytevector-output-port>)
   )
 
-(define (make-bytevector-dynamic-output-port #!optional (initial-cap 32))
+(define initial-buffer-capacity 32)
+
+(define (make-bytevector-dynamic-output-port #!optional (initial-cap initial-buffer-capacity))
   (let ((data (make-u8vector initial-cap 0)))
     (make <bytevector-dynamic-output-port>
           'data   data
@@ -248,7 +294,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
   (call-next-method)
   ;; Ensure we have at least a tiny buffer to start with for the doubling math
   (unless (slot-value port 'data)
-    (set! (slot-value port 'data) (make-u8vector 32 0))))
+    (set! (slot-value port 'data) (make-u8vector initial-buffer-capacity 0))))
 
 (define-generic (calculate-growth port requested-size))
 
@@ -279,67 +325,141 @@ The write! procedure writes up to count bytes from bytevector starting at index 
   ;; but we call next-method to update the 'size' and 'offset' slots
   (call-next-method))
 
+(define-generic (set-buffer-capacity! port))
 
 
-
-
-
-
-
-;; TEST CASES:
-
-(print "--- Testing Input Segment ---")
-(let* ((source (u8vector 10 20 30 40 50 60)) ;; The "Big" vector
-       ;; Create a port looking only at 30, 40, 50 (indices 2, 3, 4)
-       (in-port (make-bytevector-input-port source 2 3)))
-  
-  (print "Initial Pos (Relative): " (get-position in-port)) ;; Should be 0
-  (print "Byte 1: " (read-byte! in-port))                  ;; Should be 30
-  
-  (set-position! in-port 0 whence/end) 
-  (print "Pos at End: " (get-position in-port))            ;; Should be 3
-  
-  (set-position! in-port -1 whence/end)
-  (print "Last Byte: " (read-byte! in-port))               ;; Should be 50
-  
-  (print "Available: " (available in-port)))               ;; Should be 0
-
-
-
-(print "\n--- Testing Fixed Output Sandbox ---")
-(let* ((dest (make-u8vector 10 0))
-       ;; Sandbox indices 5 to 7 (3 bytes capacity)
-       (out-port (make-bytevector-output-port dest 5 3)))
-  
-  (print "Initial Size: " (available out-port))            ;; Should be 0
-  (write! out-port (u8vector 1 2))                         ;; Write 2 bytes
-  (print "Pos after 2: " (get-position out-port))          ;; Should be 2
-  
-  ;; Attempt to write 5 bytes into a 3-byte sandbox
-  (let ((written (write! out-port (u8vector 3 4 5 6 7))))
-    (print "Short Write Count: " written))                 ;; Should be 1
+(define-method (set-buffer-capacity! (port <bytevector-dynamic-output-port>) #!optional (size initial-buffer-capacity))
+  (let* ((hwm (slot-value port 'size))
+         (current-limit (slot-value port 'limit))
+         ;; The floor is the high-water mark; we cannot shrink past our data.
+         (target-cap (max hwm size)))
     
-  (print "Final Dest: " dest))                             ;; Should have 1, 2, 3 at indices 5, 6, 7
+    (unless (= target-cap current-limit)
+      (let ((new-data (make-u8vector target-cap 0))
+            (old-data (slot-value port 'data)))
+        
+        ;; Move all valid data (size) into the new allocation
+        (move-memory! old-data new-data hwm 0 0)
+        
+        (set! (slot-value port 'data) new-data)
+        (set! (slot-value port 'limit) target-cap)))
+    
+    ;; Return the relative limit
+    (slot-value port 'limit)))
 
-(print "\n--- Testing Dynamic Expansion ---")
-(let ((dyn-port (make-bytevector-dynamic-output-port 4)))   ;; Start tiny (4 bytes)
-  
-  (write! dyn-port (u8vector 101 102 103 104 105))         ;; Write 5 bytes (triggers growth)
-  (print "New Capacity (Limit): " (slot-value dyn-port 'limit)) 
-  (print "Relative Pos: " (get-position dyn-port))         ;; Should be 5
-  
-  (set-position! dyn-port 0 whence/beginning)
-  (truncate! dyn-port 2)                                   ;; Shrink logical size to 2
-  (print "Available to Read: " (available dyn-port)))      ;; Should be 2
+(define-generic (get-buffer-capacity port))
+
+(define-method (get-buffer-capacity (port <bytevector-port>))
+  (- (slot-value port 'limit) (slot-value port 'start)))
+
+(define-generic (get-output-u8vector port))
+
+(define-method (get-output-u8vector (port <bytevector-port>))
+  (let* ((data (slot-value port 'data))
+         (s (slot-value port 'start))
+         (h (slot-value port 'size)))
+    ;; Return a copy of the segment from start to the high-water mark
+    (subu8vector data s h)))
+
+(define-method (get-data-length (port <bytevector-port>))
+  (- (slot-value port 'size) (slot-value port 'start)))
+
+(define-class <buffered-port> (<output-port>)
+  ((source/sink)          ;; Any port-like object that implements write! and flush!
+   (buffer)        ;; The <bytevector-fixed-output-port> logic manager
+   (raw-buffer)))  ;; The physical u8vector backing the buffer
 
 
-(print "\n--- Testing Truncate Up ---")
-(let ((sparse-port (make-bytevector-dynamic-output-port 10)))
-  (write! sparse-port (u8vector 255))                      ;; Write 1 byte
-  (truncate! sparse-port 100)                              ;; Jump to size 100
-  (print "High-Water Mark: " (slot-value sparse-port 'size)) ;; Should be 100
-  (set-position! sparse-port 0 whence/end)
-  (print "Pos at new End: " (get-position sparse-port)))   ;; Should be 100
+(define-class <buffered-output-port> (<buffered-port> <binary-output-port> )
+  )
 
-;; END test
+(define (make-buffered-output-port source/sink #!optional (size 4096))
+  (let ((raw (make-u8vector size 0)))
+    (make <buffered-output-port>
+          'source/sink source/sink
+          'buffer (make-bytevector-output-port raw)
+          'raw-buffer raw)))
+
+(define-method (write! (port <buffered-output-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((requested  (or count (- (u8vector-length bytevector) start)))
+         (buf        (slot-value port 'buffer))
+         (source/sink       (slot-value port 'source/sink))
+         ;; Use the relative capacity helper we defined earlier
+         (free-space (- (get-buffer-capacity buf) (get-position buf))))
+    
+    (if (> requested free-space)
+        ;; --- FAST PATH (Bypass) ---
+        ;; If it won't fit, flush what we have and blast the rest to the source/sink.
+        (begin
+          (flush! port)
+          (write! source/sink bytevector start requested))
+        
+        ;; --- SLOW PATH (Buffered) ---
+        ;; If it fits, keep it in memory to aggregate small writes.
+        (write! buf bytevector start requested))))
+
+
+(define-method (flush! (port <buffered-output-port>))
+  (let ((buf  (slot-value port 'buffer))
+        (source/sink (slot-value port 'source/sink))
+        (raw  (slot-value port 'raw-buffer)))
+    (write! source/sink raw 0 (get-data-length buf))
+    (truncate! buf 0)
+    (flush! source/sink)))
+
+(define-method (write-byte! (port <buffered-output-port>) byte)
+  (let ((buf (slot-value port 'buffer)))
+    ;; If the internal buffer is full, dump it to the sink
+    (when (zero? (- (get-buffer-capacity buf) (get-position buf)))
+      (flush! port))
+    ;; Use the fast bytevector-output-port write-byte
+    (write-byte! buf byte)))
+
+(define-class <buffered-input-port> (<buffered-port> <binary-input-port> )
+  )
+
+
+(define (make-buffered-input-port source/sink #!optional (size 4096))
+  (let ((raw (make-u8vector size 0)))
+    (make <buffered-input-port>
+          'source/sink source/sink
+          'buffer (make-bytevector-input-port raw 0 0) ;; big buffer, but nothing there yet
+          'raw-buffer raw)))
+
+
+(define-method (read! (port <buffered-input-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((requested (or count (- (u8vector-length bytevector) start)))
+         (buf       (slot-value port 'buffer))
+         (cap       (u8vector-length (slot-value port 'raw-buffer)))
+		 (drained (read! buf bytevector start requested))
+		 (remaining (- requested drained)))
+     (if (zero? remaining)
+    	 drained
+	     (+ drained
+     	   (if (> remaining cap)
+		        (read! (slot-value port 'source/sink) bytevector (+ start drained) remaining)
+                (begin
+				  (fill! port)
+     	          (read! buf bytevector (+ start drained) remaining)))))))
+
+(define-method (fill! (port <buffered-input-port>))
+   (let ((raw-buf (slot-value port 'raw-buffer)))
+     (reset-input-data!
+	  (slot-value port 'buffer)
+	  raw-buf
+	  0
+	    (read! (slot-value port 'source/sink) raw-buf 0 (u8vector-length raw-buf)))))
+
+(define-method (read-byte! (port <buffered-input-port>))
+  (let* ((buffer (slot-value port 'buffer))
+		(c (read-byte! buffer)))
+	(if (eof-object? c)
+		(begin
+		  (fill! port)
+		  (read-byte! buffer))
+		c)))
+
+
+)
+
 
