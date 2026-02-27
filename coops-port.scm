@@ -1,13 +1,18 @@
 (module coops-port (
-<port> <input-port> <output-port> <binary-port>
+					<port> <input-port> <output-port> <binary-port>
      <binary-input-port> <binary-output-port>
      close closed? get-position set-position! 
      available flush! read! write! read-byte! write-byte!
-     
-     ;; Constants
+     sync! ;; New generic for fsync/fdatasync
+
+     ;; --- Constants & Enumerations ---
      whence/beginning whence/current whence/end
      
-     ;; Bytevector Implementation
+     ;; --- Unix File Flags (SRFI-170 style) ---
+     open/read open/write open/read-write
+     open/create open/exclusive open/truncate open/append
+
+     ;; --- Bytevector Port Implementation ---
      <bytevector-port> <bytevector-input-port> <bytevector-output-port>
      <bytevector-dynamic-output-port>
      make-bytevector-input-port
@@ -19,14 +24,20 @@
      get-data-length
      get-buffer-capacity
      set-buffer-capacity!
-     
-     ;; Buffered Decorators
+
+     ;; --- Raw File Port Implementation ---
+     <file-port> <file-input-port> <file-output-port>
+     make-file-input-port
+     make-file-output-port
+
+     ;; --- Buffered Decorators ---
      <buffered-port> <buffered-input-port> <buffered-output-port>
      make-buffered-input-port
      make-buffered-output-port
-     fill!)				   
-
-(import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory))
+     fill!)
+  
+  (import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory) (chicken bitwise) (chicken foreign)
+		  (chicken locative) (chicken gc))
 
 (define-class <port> ()
   ((chicken-port)
@@ -59,9 +70,9 @@ this feature, it returns #f"
 (define-method (get-position (port <port>))
   #f)
 
-(define whence/beginning 'beginning)
-(define whence/current 'current)
-(define whence/end 'end)
+(define whence/beginning (foreign-value "SEEK_SET" int))
+(define whence/current (foreign-value "SEEK_CUR" int))
+(define whence/end (foreign-value "SEEK_END" int))
 
 (define-generic (set-position! port position)
   @("Reset the position in the stream"
@@ -459,6 +470,109 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 		  (read-byte! buffer))
 		c)))
 
+(foreign-declare "#include <fcntl.h>")
+
+(define %posix-read% (foreign-lambda int "read" int c-pointer int))
+(define %posix-lseek% (foreign-lambda int "lseek" int int int))
+(define %posix-close% (foreign-lambda int "close" int))
+(define %posix-open%  (foreign-lambda int "open" c-string int int))
+(define %posix-write% (foreign-lambda int "write" int c-pointer int))
+(define %posix-fsync% (foreign-lambda int "fsync" int))
+(define %posix-fdatasync% (foreign-lambda int "fdatasync" int))
+
+(define open/read        (foreign-value "O_RDONLY" int))
+(define open/write       (foreign-value "O_WRONLY" int))
+(define open/read-write  (foreign-value "O_RDWR"   int))
+(define open/create @("Create file if it doesn't exist") (foreign-value "O_CREAT"  int))
+(define open/exclusive @("Fails if the file exists") (foreign-value "O_EXCL"   int))
+(define open/truncate @("Truncates the file") (foreign-value "O_TRUNC"  int))
+(define open/append @("Always appends to the file") (foreign-value "O_APPEND" int))
+
+
+(define-class <file-port> (<binary-port>)
+  ((fd initform: -1)))
+
+(define-method (initialize-instance (port <file-port>))
+  (call-next-method)
+  ;; Register the generic 'close' for this specific instance
+  (set-finalizer! port close))
+
+(define-method (closed? (port <file-port>))
+  (< (slot-value port 'fd) 0))
+
+(define-method (close (port <file-port>))
+  (let ((fd (slot-value port 'fd)))
+    (when (>= fd 0)
+      (%posix-close% fd)
+      (set! (slot-value port 'fd) -1)
+	  (set-finalizer! port (lambda (p) (void))))))
+
+(define-method (set-position! (port <file-port>) position #!optional (whence whence/beginning))
+  (let* ((fd (slot-value port 'fd))
+         (new-pos (%posix-lseek% fd position whence)))
+    (if (negative? new-pos) #f new-pos)))
+
+(define-generic (sync! port))
+
+(define-method (sync! (port <file-port>) #!optional (data-only? #f))
+  (let ((fd (slot-value port 'fd)))
+    (if (>= fd 0)
+        (let* ((sync-fn (if data-only? %posix-fdatasync% %posix-fsync%))
+               (result (sync-fn fd)))
+          (if (negative? result)
+              (error "sync! failed" fd)
+              result))
+        (void)))) ;; Silently succeed if already closed
+
+(define-class <file-input-port> (<binary-input-port> <file-port>)
+  )
+
+(define (make-file-input-port path #!optional (flags open/read) (mode #o644))
+  (let ((fd (%posix-open% path flags mode)))
+    (if (negative? fd)
+        (error "Could not open file raw" path)
+        (make <file-input-port> 'fd fd))))
+
+
+(define-method (read! (port <file-input-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((fd (slot-value port 'fd))
+         (requested (or count (- (u8vector-length bytevector) start)))
+         ;; We must use a locative so the FFI 'c-pointer' type gets a raw address
+         (ptr (make-locative bytevector start))
+         (result (%posix-read% fd ptr requested)))
+    (if (negative? result)
+        (error "file-read error" result)
+        result)))
+
+(define-class <file-output-port> (<binary-output-port> <file-port>)
+  )
+
+(define (make-file-output-port path #!optional (flags (bitwise-ior open/read open/create open/truncate)) (mode #o644))
+  (let ((fd (%posix-open% path flags mode)))
+    (if (negative? fd)
+        (error "Could not open file raw" path)
+        (make <file-output-port> 'fd fd))))
+
+
+(define-method (write! (port <file-output-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((fd (slot-value port 'fd))
+         (requested (or count (- (u8vector-length bytevector) start)))
+         ;; Same here: c-pointer requires a locative or raw pointer
+         (ptr (make-locative bytevector start))
+         (result (%posix-write% fd ptr requested)))
+    (if (negative? result)
+        (error "file-write error" result)
+        result)))
+
+(define (copy-port! in out #!optional (buf-size 65536))
+  (let ((buffer (make-u8vector buf-size 0)))
+    (let loop ()
+      (let ((n (read! in buffer)))
+        (if (zero? n)
+            (void) ;; Done
+            (begin
+              (write! out buffer 0 n)
+              (loop)))))))
 
 )
 

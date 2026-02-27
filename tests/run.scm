@@ -5,6 +5,7 @@
         (chicken port) 
         (chicken memory)
         (chicken condition)
+		(chicken bitwise)
         (only (chicken file) delete-file)
 		coops-port)
 
@@ -135,5 +136,60 @@
       (test "Next read-byte! is correct" 4 (read-byte! b-in))
       (test "Buffer manager now empty" 0 (available (slot-value b-in 'buffer)))))
   )
+
+(test-group "6. Raw File I/O"
+  (let* ((filename "test_io.bin")
+         (test-data (u8vector 65 66 67 68 69)) ;; "ABCDE"
+         (out-raw (make-file-output-port filename (bitwise-ior open/write open/create open/truncate)))
+         (out-buf (make-buffered-output-port out-raw 2))) ;; Tiny buffer to force flushes
+    
+    (write! out-buf test-data)
+    (close out-buf) ;; Should flush and close FD
+    
+    (let* ((in-raw (make-file-input-port filename open/read))
+           (in-buf (make-buffered-input-port in-raw 2))
+           (result (make-u8vector 5 0)))
+      (read! in-buf result)
+      (test "File round-trip matches" (u8vector->list test-data) (u8vector->list result))
+      (close in-buf))))
+
+(test-group "7. FFI Locative & Offset Validation"
+  (let* ((filename "locative_test.bin")
+         ;; Create a file containing [10, 20, 30]
+         (out (make-file-output-port filename (bitwise-ior open/write open/create open/truncate)))
+         (dummy-data (u8vector 10 20 30)))
+    
+    (write! out dummy-data)
+    (close out)
+
+    (let* ((in (make-file-input-port filename open/read))
+           ;; Target vector initialized to zeros
+           (target (make-u8vector 5 0)))
+      
+      ;; READ TEST: Read 3 bytes from file into 'target' starting at index 2
+      ;; Target should become: #u8(0 0 10 20 30)
+      (read! in target 2 3)
+      
+      (test "Data lands at correct offset via locative" 
+            '(0 0 10 20 30) 
+            (u8vector->list target))
+      (close in))))
+
+
+(test-group "8. Base <file-port> Finalizer"
+  (let ((port-ptr #f))
+    (let ((p (make-file-input-port "locative_test.bin" open/read)))
+      (set! port-ptr p)
+      (test "Port starts open" #f (closed? p)))
+    
+    (set! port-ptr #f)
+    ;; Trigger a full GC to reap the orphaned port object
+    (import (only (chicken gc) gc))
+    (gc #t) 
+    
+    (let ((p2 (make-file-input-port "locative_test.bin" open/read)))
+      (close p2)
+      (test "Manual close neutralizes finalizer safely" #t (closed? p2)))))
+
 
 (test-end "Coop-Ports")
