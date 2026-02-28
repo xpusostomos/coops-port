@@ -8,6 +8,8 @@
 		(chicken file)
         (chicken condition)
 		(chicken random)
+		(chicken io)
+		(chicken string)
 		(chicken bitwise)
         (only (chicken file) delete-file)
 		coops-port)
@@ -447,5 +449,68 @@
     
     (let ((result (read-byte! bport)))
       (test "Byte at pos 12 should be 12" 12 result))))
+
+
+(test-group "COOPS-to-CHICKEN Bridge"
+  
+  ;; 1. TEST: Raw File Port -> CHICKEN io
+  (test-group "Raw File Port Bridge"
+    (let* ((path "bridge_test.tmp")
+           (_ (with-output-to-file path (lambda () (display "Line 1\nLine 2\nLine 3"))))
+           (coops-file (make-file-input-port path))
+           (c-handle (coops-port->chicken-port coops-file)))
+      
+      (test "Identity check: COOPS -> CHICKEN -> COOPS"
+            coops-file
+              (chicken-port->coops-port c-handle))
+	  
+      (test "CHICKEN read-line (Line 1)" "Line 1" (read-line c-handle))
+      (test "CHICKEN read-line (Line 2)" "Line 2" (read-line c-handle))
+      
+      (close-input-port c-handle)
+      (test "COOPS side reflects close" #t (closed? coops-file))))
+  
+  ;; 2. TEST: Buffered Input -> High-level Peek/Read
+  (test-group "Buffered Decorator Bridge"
+    (let* ((data (string->u8vector "0123456789ABCDEF"))
+           (source (make-bytevector-input-port data))
+           (b-port (make-buffered-input-port source 8)) ;; 8 byte buffer
+           (c-handle (coops-port->chicken-port b-port)))
+	  
+      (test "Standard peek-char (binary)" #\0 (peek-char c-handle))
+      (test "Standard read-char" #\0 (read-char c-handle))
+      
+      ;; Move the logical cursor
+      (read-char c-handle) ;; #\1
+      (read-char c-handle) ;; #\2
+      
+      (test "CHICKEN read-string (5 bytes)" "34567" (read-string 5 c-handle))
+      (test "COOPS logical position sync" 8 (get-position b-port))))
+
+  ;; 3. TEST: Dynamic Output -> Standard Display/Write
+  (test-group "Dynamic Output Bridge"
+    (let* ((dyn-out (make-bytevector-dynamic-output-port 4))
+           (c-handle (coops-port->chicken-port dyn-out)))
+      
+      (display "Hello " c-handle)
+      (write-char #\W c-handle)
+      (display "orld" c-handle)
+      
+      (test "Content verify" "Hello World" 
+            (u8vector->string (get-output-u8vector dyn-out)))))
+  
+  ;; 4. TEST: Complex Interop (Chicken's copy-port)
+  (test-group "The copy-port Interop"
+    (let* ((src-data (string->u8vector "The quick brown fox"))
+           (in-coops (make-bytevector-input-port src-data))
+           (out-coops (make-bytevector-dynamic-output-port))
+           (in-handle (coops-port->chicken-port in-coops))
+           (out-handle (coops-port->chicken-port out-coops)))
+      
+      ;; Use CHICKEN's native copy-port utility
+      (copy-port in-handle out-handle)
+      
+      (test "Full copy success" "The quick brown fox" 
+            (u8vector->string (get-output-u8vector out-coops)))))))
 
 (test-end "Coop-Ports")

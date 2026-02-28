@@ -36,13 +36,16 @@
      make-buffered-input-port
      make-buffered-output-port
      fill!
-	 peek!)
+	 peek!
+	 chicken-port->coops-port
+	 coops-port->chicken-port
+)
   
   (import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory) (chicken bitwise) (chicken foreign)
 		  (chicken locative) (chicken gc))
 
 (define-class <port> ()
-  ((chicken-port)
+  ((chicken-port initform: #f)
    (buffer initform: (make-u8vector 1))))
 
 (define-generic (close port)
@@ -89,19 +92,19 @@ If position is not an integer, whence is ignored and the stream is restored stat
 
 (define-class <input-port> (<port>))
 
-(define-generic (available port)
+(define-generic (available <port>)
   @("Is data available?"
 	(port "port")
 	(@to "exact number")))
 
-(define-method (available (port <input-port>))
+(define-method (available (port <port>))
   0)
 
 (define-class <output-port> (<port>))
 
-(define-generic (flush! port))
+(define-generic (flush! <port>))
 
-(define-method (flush! (port <output-port>))
+(define-method (flush! (port <port>))
   (void))
 
 (define-class <textual-port> (<port>))
@@ -154,7 +157,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (void)))
 
 
-(define-class <bytevector-port> (<binary-input-port>)
+(define-class <bytevector-port> (<binary-port>)
   ((start initform: 0)
    (offset initform: 0)
    (size initform: 0)
@@ -180,19 +183,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
   (let ((start (slot-value port 'start)))
 	(set! (slot-value port 'offset) (+ start offset))
 	(set! (slot-value port 'size) (+ start size))
-  ;; (print "reset-input: " (get-data-length port) " st " start " of " offset " sz " size)
   ))
-
-(define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((data (slot-value port 'data))
-         (offset (slot-value port 'offset))
-         ;; The hard wall of the sandbox
-         (limit (slot-value port 'limit)) 
-         (requested (or count (- (u8vector-length bytevector) start)))
-         (to-copy (min requested (max 0 (available port)))))
-    (move-memory! data bytevector to-copy offset start)
-    (set! (slot-value port 'offset) (+ offset to-copy))
-    to-copy))
 
 (define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
   (let* ((data (slot-value port 'data))
@@ -205,7 +196,6 @@ The write! procedure writes up to count bytes from bytevector starting at index 
          ;; The "Clever" Count: Smallest of Request, Source Avail, and Dest Room
          (to-copy (max 0 (min requested avail dest-cap))))
     
-    ;; (when (> to-copy 0)
       (move-memory! data bytevector to-copy offset start)
       (set! (slot-value port 'offset) (+ offset to-copy))
     to-copy))
@@ -786,5 +776,66 @@ The write! procedure writes up to count bytes from bytevector starting at index 
             (begin
               (write! out buffer 0 n)
               (loop)))))))
+
+
+(define (make-coops-wrapper-port coops-obj)
+  (let* ((class
+          (vector 
+           ;; 0: read-char (Must return #\char or #!eof)
+           (lambda (p) 
+             (let ((b (read-byte! coops-obj)))
+               (if (eof-object? b) b (integer->char b))))
+           
+           ;; 1: peek-char (Must return #\char or #!eof)
+           (lambda (p) 
+             (let ((b (peek-byte! coops-obj)))
+               (if (eof-object? b) b (integer->char b))))
+           
+           ;; 2: write-char (Standard char->integer)
+           (lambda (p c) (write-byte! coops-obj (char->integer c))) 
+           
+           ;; 3: write-string (Standard bytes-out)
+           (lambda (p s) (write! coops-obj s))      
+           
+           ;; 4: close
+           (lambda (p d) (close coops-obj))         
+           
+           ;; 5: flush-output
+           (lambda (p) (flush! coops-obj))          
+           
+           ;; 6: char-ready?
+           (lambda (p) (> (available coops-obj) 0)) 
+           
+           ;; 7: read-string! (The optimized block-read hook)
+           ;; CHICKEN passes: (port dest-string count)
+           (lambda (p dest n) 
+             (read! coops-obj dest 0 n))
+           
+           ;; 8: read-line (We let CHICKEN use its default logic)
+           #f))                                     
+         
+         (type (if (subclass? (class-of coops-obj) <input-port>) 1 2))
+         (c-port (##sys#make-port type class "(coops-port)" 'custom))
+         (data (vector #f coops-obj)))
+    
+    (##sys#set-port-data! c-port data)
+    (set! (slot-value coops-obj 'chicken-port) c-port)
+    c-port))
+
+(define (chicken-port->coops-port c-port)
+  (if (##sys#port? c-port)
+      (let ((data (##sys#port-data c-port))) 
+        (if (and (vector? data) (>= (vector-length data) 2))
+            (##sys#slot data 1) ;; Extract from the 2nd slot of the data vector
+            #f))
+      #f))
+
+(define (coops-port->chicken-port coops-port)
+  (let ((h (slot-value coops-port 'chicken-port)))
+    ;; If the slot is unbound or #f, create the wrapper now
+    (if (port? h) 
+        h
+        (make-coops-wrapper-port coops-port))))
+
 
 )
