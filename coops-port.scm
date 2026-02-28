@@ -1,8 +1,9 @@
-(module coops-port (
-					<port> <input-port> <output-port> <binary-port>
+(module coops-port
+	(
+	 <port> <input-port> <output-port> <binary-port>
      <binary-input-port> <binary-output-port>
      close closed? get-position set-position! 
-     available flush! read! write! read-byte! write-byte!
+     available flush! read! write! read-byte! write-byte! peek-byte!
      sync! ;; New generic for fsync/fdatasync
 
      ;; --- Constants & Enumerations ---
@@ -34,7 +35,8 @@
      <buffered-port> <buffered-input-port> <buffered-output-port>
      make-buffered-input-port
      make-buffered-output-port
-     fill!)
+     fill!
+	 peek!)
   
   (import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory) (chicken bitwise) (chicken foreign)
 		  (chicken locative) (chicken gc))
@@ -122,6 +124,11 @@ If position is not an integer, whence is ignored and the stream is restored stat
         (u8vector-ref bv 0)
         #!eof)))
 
+(define-generic (peek-byte! port)
+  @("Returns the next byte from the port without advancing the offset"
+    (port "port")
+    (@to "octet or #!eof")))
+
 (define-class <binary-output-port> (<binary-port> <output-port>))
 
 (define-generic (write! port bytevector)
@@ -156,27 +163,26 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-class <bytevector-input-port> (<binary-input-port> <bytevector-port>))
 
-(define (make-bytevector-input-port data #!optional (start 0) (count #f))
+(define (make-bytevector-input-port data #!optional (start 0) (count #f) (limit #f))
   (let* ((data-len (u8vector-length data))
+         (actual-limit (or limit (- data-len start)))
          (actual-count (or count (- data-len start)))
-         (end (+ start actual-count)))
+         (size (+ start actual-count))
+		 (nlimit (+ start actual-limit)))
     (make <bytevector-input-port> 
-          'data  data
-          'start start
-          'offset start
-          'size  end
-          'limit end)))
+      'data  data
+      'start start
+      'offset start
+      'size  size
+      'limit nlimit)))
 
-(define-method (reset-input-data! (port <bytevector-input-port>) data #!optional (start 0) (count #f))
- (let* ((data-len (u8vector-length data))
-         (actual-count (or count (- data-len start)))
-         (end (+ start actual-count)))
-   (set! (slot-value port 'data) data)
-   (set! (slot-value port 'start) start)
-   (set! (slot-value port 'offset) start)
-   (set! (slot-value port 'size) end)
-   (set! (slot-value port 'limit) end)))
- 
+(define-method (reset-input-data! (port <bytevector-input-port>) offset size)
+  (let ((start (slot-value port 'start)))
+	(set! (slot-value port 'offset) (+ start offset))
+	(set! (slot-value port 'size) (+ start size))
+  ;; (print "reset-input: " (get-data-length port) " st " start " of " offset " sz " size)
+  ))
+
 (define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
   (let* ((data (slot-value port 'data))
          (offset (slot-value port 'offset))
@@ -188,6 +194,23 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (set! (slot-value port 'offset) (+ offset to-copy))
     to-copy))
 
+(define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((data (slot-value port 'data))
+         (offset (slot-value port 'offset))
+         (avail (available port))
+         ;; How much space is actually in the target?
+         (dest-cap (- (u8vector-length bytevector) start))
+         ;; How much did they ask for?
+         (requested (or count dest-cap))
+         ;; The "Clever" Count: Smallest of Request, Source Avail, and Dest Room
+         (to-copy (max 0 (min requested avail dest-cap))))
+    
+    ;; (when (> to-copy 0)
+      (move-memory! data bytevector to-copy offset start)
+      (set! (slot-value port 'offset) (+ offset to-copy))
+    to-copy))
+
+
 (define-method (read-byte! (port <bytevector-input-port>))
   (let ((offset (slot-value port 'offset)))
 	(if (< offset (slot-value port 'size))
@@ -196,12 +219,30 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 		  (u8vector-ref (slot-value port 'data) offset))
         #!eof)))
 
+(define-method (peek-byte! (port <bytevector-input-port>))
+  (let ((offset (slot-value port 'offset))
+        (size   (slot-value port 'size)))
+    (if (< offset size)
+        (u8vector-ref (slot-value port 'data) offset)
+        #!eof)))
+
 (define-method (available (port <bytevector-port>))
   (max 0 (- (slot-value port 'size) (slot-value port 'offset))))
 
 (define-method (get-position (port <bytevector-port>))
   (- (slot-value port 'offset) (slot-value port 'start)))
 
+
+(define-method (peek! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((data      (slot-value port 'data))
+         (offset    (slot-value port 'offset))
+         (limit     (slot-value port 'limit)) ;; The logical "wall"
+         (requested (or count (- (u8vector-length bytevector) start)))
+         ;; Use available, which is already calculated as (- size offset)
+         (to-copy   (min requested (available port))))
+    
+    (move-memory! data bytevector to-copy offset start)
+	to-copy))
 
 (define-method (set-position! (port <bytevector-port>) position #!optional (whence whence/beginning))
   (let* ((s (slot-value port 'start))
@@ -380,6 +421,9 @@ The write! procedure writes up to count bytes from bytevector starting at index 
    (buffer)        ;; The <bytevector-fixed-output-port> logic manager
    (raw-buffer)))  ;; The physical u8vector backing the buffer
 
+(define-method (get-data-length (port <buffered-port>))
+  (let ((source (slot-value port 'source/sink)))
+    (get-data-length source)))
 
 (define-class <buffered-output-port> (<buffered-port> <binary-output-port> )
   )
@@ -392,22 +436,30 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           'raw-buffer raw)))
 
 (define-method (write! (port <buffered-output-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((requested  (or count (- (u8vector-length bytevector) start)))
-         (buf        (slot-value port 'buffer))
-         (source/sink       (slot-value port 'source/sink))
-         ;; Use the relative capacity helper we defined earlier
-         (free-space (- (get-buffer-capacity buf) (get-position buf))))
-    
-    (if (> requested free-space)
-        ;; --- FAST PATH (Bypass) ---
-        ;; If it won't fit, flush what we have and blast the rest to the source/sink.
-        (begin
-          (flush! port)
-          (write! source/sink bytevector start requested))
-        
-        ;; --- SLOW PATH (Buffered) ---
-        ;; If it fits, keep it in memory to aggregate small writes.
-        (write! buf bytevector start requested))))
+  (let* ((requested   (or count (- (u8vector-length bytevector) start)))
+         (buf         (slot-value port 'buffer))
+         (source/sink (slot-value port 'source/sink))
+         (capacity    (get-buffer-capacity buf))
+         (p           (get-position buf))
+         (free-space  (- capacity p)))
+	
+    (cond
+     ;; 1. Fits entirely in the current buffer
+     ((<= requested free-space)
+      (write! buf bytevector start requested))
+	 
+     ;; 2. Larger than the total buffer capacity: BYPASS
+     ((> requested capacity)
+      (flush! port)
+      (write! source/sink bytevector start requested))
+	 
+     ;; 3. Fits in the buffer, but not in the *current* free space: SPLIT/REFILL
+     (else
+      ;; Fill up the remaining free space and dump it
+      (write! buf bytevector start free-space)
+      (flush! port)
+      ;; Put the leftover in the now-empty buffer
+      (write! buf bytevector (+ start free-space) (- requested free-space))))))
 
 
 (define-method (flush! (port <buffered-output-port>))
@@ -434,33 +486,131 @@ The write! procedure writes up to count bytes from bytevector starting at index 
   (let ((raw (make-u8vector size 0)))
     (make <buffered-input-port>
           'source/sink source/sink
-          'buffer (make-bytevector-input-port raw 0 0) ;; big buffer, but nothing there yet
+          'buffer (make-bytevector-input-port raw 0 0 size) ;; big buffer, but nothing there yet
           'raw-buffer raw)))
-
 
 (define-method (read! (port <buffered-input-port>) bytevector #!optional (start 0) (count #f))
   (let* ((requested (or count (- (u8vector-length bytevector) start)))
          (buf       (slot-value port 'buffer))
          (cap       (u8vector-length (slot-value port 'raw-buffer)))
-		 (drained (read! buf bytevector start requested))
-		 (remaining (- requested drained)))
-     (if (zero? remaining)
-    	 drained
-	     (+ drained
-     	   (if (> remaining cap)
-		        (read! (slot-value port 'source/sink) bytevector (+ start drained) remaining)
-                (begin
-				  (fill! port)
-     	          (read! buf bytevector (+ start drained) remaining)))))))
+         (drained   (read! buf bytevector start requested))
+         (remaining (- requested drained)))
+    
+    (+ drained
+       (cond ((zero? remaining) 0)
+			 ((> remaining cap)
+              ;; --- BYPASS BRANCH ---
+              ;; We move the source independently of the buffer. 
+              ;; We MUST nuke the buffer to prevent "Stale Window" hits.
+              (reset-input-data! buf 0 0)
+              (read! (slot-value port 'source/sink) bytevector (+ start drained) remaining))
+             
+             ;; --- REFILL BRANCH ---
+             (else (fill! port) ;; fill! handles its own reset-input-data!
+				   ;; NO MANUAL RESET HERE!
+				   (let ((to-read (min remaining (available buf))))
+					 (read! buf bytevector (+ start drained) to-read)))))))
+
+(define-method (get-position (port <buffered-output-port>))
+  (let* ((source (slot-value port 'source/sink))
+         (buf    (slot-value port 'buffer))
+         (source-pos (get-position source)))
+    (if (not source-pos)
+        #f
+        ;; User is ahead of the source by the amount currently sitting in the buffer
+        (+ source-pos (get-data-length buf)))))
+
+
+(define-method (set-position! (port <buffered-input-port>) position #!optional (whence whence/beginning))
+  (let* ((buf    (slot-value port 'buffer))
+         (source (slot-value port 'source/sink)))
+    
+    (cond
+     ;; --- Case A: Relative Seek (Socket-friendly / 0 Syscalls) ---
+     ;; We check the delta against what's actually in the manager right now.
+     ((eq? whence whence/current)
+      (let ((avail (available buf))
+            (used  (get-position buf))) 
+        (if (and (>= position (- used)) (<= position avail))
+            ;; CACHE HIT: We just slide the manager's offset.
+            (set-position! buf position whence/current)
+            ;; CACHE MISS: We finally admit we need the ground truth.
+            (let* ((sp (get-position source))
+                   (logical-now (- sp avail)))
+              (reset-input-data! buf 0 0)
+              (set-position! source (+ logical-now position) whence/beginning)))))
+
+     ;; --- Case B: Absolute Seek (Requires Window Math) ---
+     (else
+      (let* ((target-pos (if (eq? whence whence/beginning) 
+                             position 
+                             (+ (get-position source 0 whence/end) position)))
+             ;; We calculate where the buffer window starts in the file
+             ;; using the invariant: SourcePos - DataLength
+             (sp (get-position source))
+             (dl (get-data-length buf))
+             (window-start (- sp dl)))
+        
+        (if (and (>= target-pos window-start) (<= target-pos sp))
+            ;; CACHE HIT: Move manager relative to the calculated window start
+            (set-position! buf (- target-pos window-start) whence/beginning)
+            ;; CACHE MISS: Nuke and move hardware
+            (begin
+              (reset-input-data! buf 0 0)
+              (set-position! source target-pos whence/beginning))))))))
+
+(define-method (c (port <buffered-input-port>) n)
+  (let ((raw      (slot-value port 'raw-buffer)))
+	(u8vector-ref raw n)))
+
+(define (print-u8vector vec)
+  (for-each (lambda (byte)
+              (display byte)
+              (display " "))
+            (u8vector->list vec))
+  (newline))
+
 
 (define-method (fill! (port <buffered-input-port>))
-   (let ((raw-buf (slot-value port 'raw-buffer)))
-     (reset-input-data!
-	  (slot-value port 'buffer)
-	  raw-buf
-	  0
-	    (read! (slot-value port 'source/sink) raw-buf 0 (u8vector-length raw-buf)))))
+  (let* ((source   (slot-value port 'source/sink))
+         (buf-mgr  (slot-value port 'buffer))
+         (raw      (slot-value port 'raw-buffer))
+         (capacity (get-buffer-capacity buf-mgr)))
+	(when (zero? (available buf-mgr))
+        (reset-input-data! buf-mgr 0 0))
 
+    ;; 2. Part 2: Reuse the same variable names for the actual read logic.
+    (let* ((pos     (get-position buf-mgr))
+           (cur-len (get-data-length buf-mgr))
+           (room    (- capacity cur-len)))
+      (if (> room 0)
+          (let ((sz (read! source raw cur-len room)))
+            (reset-input-data! buf-mgr pos (+ cur-len sz))
+            sz)
+          0))))
+
+
+(define-method (peek! (port <buffered-input-port>) bytevector #!optional (start 0) (count #f))
+  (let* ((buf-mgr    (slot-value port 'buffer))
+         (raw-buffer (slot-value port 'raw-buffer))
+         (capacity   (get-buffer-capacity buf-mgr))
+         (requested  (or count (- (u8vector-length bytevector) start))))
+
+    (when (> requested capacity)
+      (error "peek! request exceeds buffer capacity" requested capacity))
+
+    (let ((avail (available buf-mgr)))
+      ;; 1. If we don't have enough, shuffle and refill.
+      (when (< avail requested)
+        (let ((rel-off (get-position buf-mgr)))
+          (move-memory! raw-buffer raw-buffer avail rel-off 0)
+          (reset-input-data! buf-mgr 0 avail)
+          (fill! port)))
+
+      ;; 2. CACHE HIT: The data is now hopefully in the buffer's window
+      ;; Just delegate the actual copy-out to the buffer's peek! method.
+      (peek! buf-mgr bytevector start requested))))
+  
 (define-method (read-byte! (port <buffered-input-port>))
   (let* ((buffer (slot-value port 'buffer))
 		(c (read-byte! buffer)))
@@ -469,6 +619,23 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 		  (fill! port)
 		  (read-byte! buffer))
 		c)))
+
+(define-method (peek-byte! (port <buffered-input-port>))
+  (let ((buf-mgr (slot-value port 'buffer)))
+    (if (> (available buf-mgr) 0)
+        ;; Fast path: We have data, just grab it from the manager
+        (peek-byte! buf-mgr)
+        ;; Slow path: Buffer is empty. Let the existing peek! 
+        ;; handle the complex refill/shuffle logic.
+        (let ((bv (make-u8vector 1 0)))
+          (if (= (peek! port bv 0 1) 1)
+              (u8vector-ref bv 0)
+              #!eof)))))
+
+(define-method (available (port <buffered-input-port>))
+  (+ (available (slot-value port 'buffer))
+     (available (slot-value port 'source/sink))))
+
 
 (foreign-declare "#include <fcntl.h>")
 
@@ -512,6 +679,11 @@ The write! procedure writes up to count bytes from bytevector starting at index 
          (new-pos (%posix-lseek% fd position whence)))
     (if (negative? new-pos) #f new-pos)))
 
+(define-method (get-position (port <file-port>))
+  (let* ((fd (slot-value port 'fd))
+         (new-pos (%posix-lseek% fd 0 whence/current)))
+    (if (negative? new-pos) #f new-pos)))
+
 (define-generic (sync! port))
 
 (define-method (sync! (port <file-port>) #!optional (data-only? #f))
@@ -530,9 +702,9 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define (make-file-input-port path #!optional (flags open/read) (mode #o644))
   (let ((fd (%posix-open% path flags mode)))
     (if (negative? fd)
-        (error "Could not open file raw" path)
+        (begin 
+          (error "Could not open file raw" path))
         (make <file-input-port> 'fd fd))))
-
 
 (define-method (read! (port <file-input-port>) bytevector #!optional (start 0) (count #f))
   (let* ((fd (slot-value port 'fd))
@@ -544,10 +716,51 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (error "file-read error" result)
         result)))
 
+
+(define-method (get-position (port <buffered-input-port>))
+  (let* ((source (slot-value port 'source/sink))
+         (buf    (slot-value port 'buffer))
+         (source-pos (get-position source)))
+    (if (not source-pos)
+        #f
+        ;; The source is ahead of the user by the number of unread bytes in the buffer
+        (- source-pos (available buf)))))
+
+
+(foreign-declare "#include <sys/stat.h>"
+)
+
+(define %posix-fstat-size% 
+  (foreign-lambda* int ((int fd))
+    "struct stat buf;
+     int size = -1;
+     if (fstat(fd, &buf) == 0) size = buf.st_size;
+     C_return(size);"))
+
+(define %posix-socket-available%
+  (foreign-lambda* int ((int fd))
+    "int count = -1;
+     #ifdef FIONREAD
+     if (ioctl(fd, FIONREAD, &count) == -1) count = -1;
+     #endif
+     C_return(count);"))
+
+(define-method (get-data-length (port <file-port>))
+  (let ((size (%posix-fstat-size% (slot-value port 'fd))))
+    (if (negative? size) 0 size)))
+
+(define-method (available (port <file-input-port>))
+  (let ((total (get-data-length port))
+        (curr  (get-position port)))
+    (if (and total curr)
+        (max 0 (- total curr))
+        0)))
+
+
 (define-class <file-output-port> (<binary-output-port> <file-port>)
   )
 
-(define (make-file-output-port path #!optional (flags (bitwise-ior open/read open/create open/truncate)) (mode #o644))
+(define (make-file-output-port path #!optional (flags (bitwise-ior open/write open/create open/truncate)) (mode #o644))
   (let ((fd (%posix-open% path flags mode)))
     (if (negative? fd)
         (error "Could not open file raw" path)
@@ -575,5 +788,3 @@ The write! procedure writes up to count bytes from bytevector starting at index 
               (loop)))))))
 
 )
-
-

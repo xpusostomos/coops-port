@@ -1,17 +1,82 @@
 (import test 
         coops 
-        srfi-4 
+        srfi-4
+		srfi-1
         (chicken base) 
         (chicken port) 
         (chicken memory)
+		(chicken file)
         (chicken condition)
+		(chicken random)
 		(chicken bitwise)
         (only (chicken file) delete-file)
 		coops-port)
 
+(define random pseudo-random-integer)
+
+(define large-data (make-u8vector 5000))
+
+; Fill with a predictable pattern so we can detect mismatches
+(do ((i 0 (+ i 1)))
+    ((= i 5000))
+  (u8vector-set! large-data i (modulo i 256)))
+
+(define (run-input-stress-test port-gen source-data ops-count)
+  (let* ((data-len (u8vector-length source-data))
+         (port     (port-gen source-data))
+         ;; Use your correct COOPS class check
+         (buf-cap  (if (subclass? (class-of port) <buffered-input-port>)
+                       (get-buffer-capacity (slot-value port 'buffer))
+                       1024))
+         (ref-pos  0))
+    (do ((i 0 (+ i 1)))
+        ((= i ops-count))
+      (let ((op (pseudo-random-integer 4)))
+        (cond 
+         ;; OP 0: Read Byte
+         ((= op 0)
+          (let ((b1 (read-byte! port))
+                (b2 (if (< ref-pos data-len) (u8vector-ref source-data ref-pos) #!eof)))
+            (unless (eqv? b1 b2) (error "Stress: read-byte mismatch" b1 b2))
+            (unless (eof-object? b1) (set! ref-pos (+ ref-pos 1)))))
+
+         ;; OP 1: Peek Data
+         ((= op 1)
+          (let* ((max-p (min buf-cap (- data-len ref-pos)))
+                 (count (if (<= max-p 0) 0 (+ 1 (pseudo-random-integer max-p)))))
+            (when (> count 0)
+              (let ((buf (make-u8vector count)))
+                (peek! port buf 0 count)
+                (do ((j 0 (+ j 1)))
+                    ((= j count))
+                  (let ((b1 (u8vector-ref buf j))
+                        (b2 (u8vector-ref source-data (+ ref-pos j))))
+                    (unless (eqv? b1 b2) (error "Stress: peek! data mismatch" b1 b2))))))))
+
+         ;; OP 2: Bulk Read
+         ((= op 2)
+          (let* ((max-r (min 64 (- data-len ref-pos)))
+                 (count (if (<= max-r 0) 0 (+ 1 (pseudo-random-integer max-r)))))
+            (when (> count 0)
+              (let* ((buf (make-u8vector count))
+                     (n   (read! port buf 0 count)))
+                (do ((j 0 (+ j 1)))
+                    ((= j n))
+                  (let ((b1 (u8vector-ref buf j))
+                        (b2 (u8vector-ref source-data (+ ref-pos j))))
+                    (unless (eqv? b1 b2) (error "Stress: read! data mismatch" b1 b2))))
+                (set! ref-pos (+ ref-pos n))))))
+
+         ;; OP 3: Random Seek
+         ((= op 3)
+          (let ((new-pos (pseudo-random-integer data-len)))
+            (set-position! port new-pos)
+            (set! ref-pos new-pos))))))
+    #t))
+
 (test-begin "Coop-Ports")
 
-;; --- 1. Bytevector Input Ports ---
+;;--- 1. Bytevector Input Ports ---
 (test-group "1. Bytevector Input Ports"
   (let* ((source (u8vector 10 20 30 40 50 60))
          (in-port (make-bytevector-input-port source 2 3))) ;; Segment: [30, 40, 50]
@@ -191,5 +256,196 @@
       (close p2)
       (test "Manual close neutralizes finalizer safely" #t (closed? p2)))))
 
+(test-group "9. Buffered Input Peek & Shuffle"
+  (let* ((data (u8vector 1 2 3 4 5 6 7 8 9 10))
+         ;; Create a tiny 6-byte buffer to force refills/shuffles quickly
+         (src  (make-bytevector-input-port data))
+         (bport (make-buffered-input-port src 6))
+         (target (make-u8vector 4 0)))
+
+    ;; 1. Initial read to move the offset
+    ;; Buffer: [1, 2, 3, 4, 5, 6], offset: 0 -> 3
+    (test "Initial read of 3 bytes" 3 (read! bport (make-u8vector 3)))
+    (test "Current offset is 3" 3 (get-position (slot-value bport 'buffer)))
+
+    ;; 2. Peek for 4 bytes. 
+    ;; Only 3 bytes (4, 5, 6) are available in the 6-byte buffer.
+    ;; This MUST trigger a slide: [4, 5, 6] moves to [0, 1, 2]
+    ;; Then a fill! appends [7, 8, 9] to [3, 4, 5]
+    (test "Peek 4 bytes across shuffle boundary" 4 (peek! bport target 0 4))
+    (test "Peeked data is correct" '(4 5 6 7) (u8vector->list target))
+
+    ;; 3. Verify Idempotency: The offset should still be at the '4'
+    (test "Offset did not move after peek" 4 (read-byte! bport))
+    
+    ;; 4. Verify the rest of the stream is intact
+    (let ((remainder (make-u8vector 5 0)))
+      (read! bport remainder)
+      (test "Stream remains contiguous after shuffle" 
+            '(5 6 7 8 9) 
+            (u8vector->list remainder)))))
+
+(test-group "10 Peek-Byte Validation"
+  (let* ((data (u8vector 100 101 102))
+         (src  (make-bytevector-input-port data))
+         (bport (make-buffered-input-port src 2)))
+    (test "Peek-byte returns 100" 100 (peek-byte! bport))
+    (test "Peek-byte is idempotent" 100 (peek-byte! bport))
+    (read-byte! bport)
+    (test "After read, peek-byte returns 101" 101 (peek-byte! bport))))
+
+(test-group "11. Cross-Implementation Stress Tests"
+  (let ((large-data (list->u8vector (map (lambda (x) (random 256)) (make-list 1000)))))
+
+    (test "Raw Bytevector Input Stress" #t
+          (run-input-stress-test 
+           (lambda (d) (make-bytevector-input-port d)) 
+           large-data 5000))
+
+    (test "Buffered Input (Small Buffer) Stress" #t
+          (run-input-stress-test 
+           (lambda (d) (make-buffered-input-port (make-bytevector-input-port d) 16)) 
+           large-data 5000))
+
+    (test "Buffered Input (Standard Buffer) Stress" #t
+          (run-input-stress-test 
+           (lambda (d) (make-buffered-input-port (make-bytevector-input-port d) 1024)) 
+           large-data 5000))))
+
+(test-group "12. File-Input Stress Tests"
+  (let* ((size 5000)
+         (filename "stress-test.bin")
+         (large-data (list->u8vector (map (lambda (x) (pseudo-random-integer 256)) (make-list size)))))
+    
+    ;; 1. Setup file
+    (let ((out (make-file-output-port filename)))
+      (write! out large-data)
+      (close out))
+
+    ;; 2. Test with fresh ports per run
+    (test "Buffered File Input (Tiny 13b Buffer)" #t
+          (run-input-stress-test 
+           (lambda (d) (make-buffered-input-port (make-file-input-port filename) 13)) 
+           large-data 2000))
+
+    (test "Buffered File Input (Page-size 4k Buffer)" #t
+          (run-input-stress-test 
+           (lambda (d) (make-buffered-input-port (make-file-input-port filename) 4096)) 
+           large-data 2000))
+
+    (when (file-exists? filename) (delete-file filename))))
+
+(test-group "Minimal Peek-Shuffle Failure Case"
+  (let* ((data (u8vector 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15))
+         (src  (make-bytevector-input-port data))
+         ;; 1. Create a port with a 10-byte buffer
+         (bport (make-buffered-input-port src 10))
+         (peek-buf (make-u8vector 5 0)))
+
+    ;; 2. Move cursor to index 7. 
+    ;; Buffer manager now has: pos=7, len=10, available=3.
+    ;; The internal data is [7, 8, 9].
+    (read! bport (make-u8vector 7))
+    
+    ;; 3. Request a Peek of 5 bytes. 
+    ;; Since available (3) < requested (5), the port MUST:
+    ;;   a. Slide [7, 8, 9] from index 7 to index 0.
+    ;;   b. Update manager to pos=0, len=3.
+    ;;   c. Call fill! to get more data (fetching 10, 11, 12, etc.)
+    (peek! bport peek-buf 0 5)
+
+    (test "The peeked data should be (7 8 9 10 11)" 
+          '(7 8 9 10 11) 
+          (u8vector->list peek-buf))
+
+    (test "The next read-byte should still be 7 (Idempotency)" 
+          7 
+          (read-byte! bport))))
+(test-group "The Bypass-Peek Synchronization Bug"
+  (let* ((data (u8vector 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20))
+         (src  (make-bytevector-input-port data))
+         (bport (make-buffered-input-port src 4)) ;; Small buffer to force bypass
+         (target (make-u8vector 10 0)))
+    (read-byte! bport) ;; Buffer fills [1 2 3 4], pos=1, avail=3
+    ;; Request 10 bytes: 3 from buffer, 7 via Bypass from source.
+    ;; If the Bypass doesn't reset the manager, the manager still thinks it has data!
+    (read! bport target 0 10) 
+    (test "The next byte must be 12" 12 (peek-byte! bport))))
+
+(test-group "The Stale Window Seek Bug"
+  (let* ((data (u8vector 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20))
+         (src  (make-bytevector-input-port data))
+         (bport (make-buffered-input-port src 5)) ;; 5-byte buffer
+         (target (make-u8vector 10 0)))
+    (read-byte! bport) ;; Fills [1 2 3 4 5], pos=1, avail=4. Source is at 5.
+    (read! bport target 0 10) ;; Drains 4, Bypasses 6. Source is now at 11.
+    ;; The buffer is logically exhausted, but NOT reset. 
+    ;; Window-start = 11 - 5 = 6. Window-end = 11.
+    (set-position! bport 7) ;; Seek to absolute 7. 
+    ;; This is inside the [6, 11] window! The port will treat this as a Cache Hit.
+    (test "Byte at pos 7 should be 8" 8 (read-byte! bport))))
+
+
+(test-group "The Refill-Shift Logic Failure"
+  (let* ((data (u8vector 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19))
+         ;; 10 byte buffer
+         (bport (make-buffered-input-port (make-bytevector-input-port data) 10))
+         (trash (make-u8vector 5 0)))
+
+    ;; 1. Fill buffer: [0-9], Source at 10.
+    (fill! bport) 
+
+    ;; 2. Drain 7 bytes: Buffer has left. Source still at 10.
+    (read! bport trash 0 7)
+
+    ;; 3. Read 5 more bytes. 
+    ;; Drained=3. Remaining=2.
+    ;; 2 < 10, so NO BYPASS. 
+    ;; fill! is called. Buffer was empty? No, 3 were left.
+    ;; If fill! appends, we are fine. 
+    ;; IF fill! resets because we were "at the wall", the window shifts.
+    (read! bport trash 0 5)
+
+    ;; 4. Now Seek to 8.
+    ;; Current Source Pos is 12 (10 from fill + 2 read).
+    ;; Buffer has 8 bytes left (starts at file pos 12).
+    ;; Old Math: 12 - (available 8) = 4.
+    ;; Math says: "8 is between 4 and 12. CACHE HIT!"
+    ;; Reality: The buffer contains bytes [12, 13, 14...]. 
+    ;; Position 8 is GONE from the buffer.
+    (set-position! bport 8)
+    
+    (test "Should be 8" 8 (read-byte! bport))))
+
+
+(test-group "The Stale Window Stress Trigger"
+  (let* ((data (u8vector 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19))
+         ;; Small 8-byte buffer to force frequent refills
+         (bport (make-buffered-input-port (make-bytevector-input-port data) 8))
+         (target (make-u8vector 10 0)))
+
+    ;; 1. Prime the buffer (Reads 0-7, Source moves to 8)
+    (read-byte! bport) 
+
+    ;; 2. Trigger a Bypass Read (Size 10 > Capacity 8)
+    ;; This reads bytes 1-10 directly from source.
+    ;; Source moves to 11. Buffer manager is reset.
+    (read! bport target 0 10)
+
+    ;; 3. Now the "Ghost" setup:
+    ;; If we call available or peek now, fill! might trigger.
+    ;; Source is at 11. Buffer fills with.
+    (peek-byte! bport)
+
+    ;; 4. The Killing Seek:
+    ;; target-pos 7. 
+    ;; Old Math: source-pos(19) - dl(8) = 11. Is 7 in? No.
+    ;; BUT, if the math sees dl as 16 or source as 11... 
+    ;; We want to verify that seeking to a previously bypassed byte 
+    ;; doesn't accidentally pull from the NEW buffer content.
+    (set-position! bport 12)
+    
+    (let ((result (read-byte! bport)))
+      (test "Byte at pos 12 should be 12" 12 result))))
 
 (test-end "Coop-Ports")
