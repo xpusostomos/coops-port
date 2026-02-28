@@ -42,7 +42,7 @@
 )
   
   (import scheme coops srfi-4 (chicken base) (chicken port) (chicken memory) (chicken bitwise) (chicken foreign)
-		  (chicken locative) (chicken gc))
+		  (chicken locative) (chicken gc) (chicken blob))
 
 (define-class <port> ()
   ((chicken-port initform: #f)
@@ -115,6 +115,11 @@ If position is not an integer, whence is ignored and the stream is restored stat
 
 (define-generic (read! port bytevector))
 
+(define-method (read! (port <port>) (dest-str string) start count)
+  ;; Zero-copy: Alias the string's memory as a u8vector
+  (let ((alias (blob->u8vector (string->blob dest-str))))
+    (read! port alias start count)))
+
 (define-generic (read-byte! port)
   @("Read one octet from the port"
 	(port "port")
@@ -185,18 +190,25 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 	(set! (slot-value port 'size) (+ start size))
   ))
 
-(define-method (read! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((data (slot-value port 'data))
+(define-method (read! (port <bytevector-input-port>) target #!optional (start 0) (count #f))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+						   ((integer? target) target)
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (io-buf (cond ((u8vector? target) target)
+					   ((integer? target) (make-u8vector target 0))
+                       (else (make-locative target))))
+		 (data (slot-value port 'data))
          (offset (slot-value port 'offset))
          (avail (available port))
          ;; How much space is actually in the target?
-         (dest-cap (- (u8vector-length bytevector) start))
+         (dest-cap (- io-len start))
          ;; How much did they ask for?
          (requested (or count dest-cap))
          ;; The "Clever" Count: Smallest of Request, Source Avail, and Dest Room
          (to-copy (max 0 (min requested avail dest-cap))))
-    
-      (move-memory! data bytevector to-copy offset start)
+	(move-memory! data io-buf to-copy offset start)
       (set! (slot-value port 'offset) (+ offset to-copy))
     to-copy))
 
@@ -223,15 +235,23 @@ The write! procedure writes up to count bytes from bytevector starting at index 
   (- (slot-value port 'offset) (slot-value port 'start)))
 
 
-(define-method (peek! (port <bytevector-input-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((data      (slot-value port 'data))
+(define-method (peek! (port <bytevector-input-port>) target #!optional (start 0) (count #f))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+						   ((integer? target) target)
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (io-buf (cond ((u8vector? target) target)
+					   ((integer? target) (make-u8vector target 0))
+                       (else (make-locative target))))
+		 (data      (slot-value port 'data))
          (offset    (slot-value port 'offset))
          (limit     (slot-value port 'limit)) ;; The logical "wall"
-         (requested (or count (- (u8vector-length bytevector) start)))
+         (requested (or count (- io-len start)))
          ;; Use available, which is already calculated as (- size offset)
          (to-copy   (min requested (available port))))
     
-    (move-memory! data bytevector to-copy offset start)
+    (move-memory! data io-buf to-copy offset start)
 	to-copy))
 
 (define-method (set-position! (port <bytevector-port>) position #!optional (whence whence/beginning))
@@ -264,8 +284,16 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           'size   start  ;; Initially 0 bytes written
           'limit  end)))
 
-(define-method (write! (port <bytevector-output-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((requested (or count (- (u8vector-length bytevector) start)))
+(define-method (write! (port <bytevector-output-port>) target #!optional (start 0) (count #f))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+						   ((integer? target) target)
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (io-buf (cond ((u8vector? target) target)
+					   ((integer? target) (make-u8vector target 0))
+                       (else (make-locative target))))
+		 (requested (or count (- io-len start)))
          (p (slot-value port 'offset)))
     
     ;; 1. Prepare the sandbox (Dynamic: grows 'limit'; Fixed: does nothing)
@@ -274,7 +302,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (let* ((limit (slot-value port 'limit))
            (to-write (min requested (max 0 (- limit p)))))
       
-      (move-memory! bytevector (slot-value port 'data) to-write start p)
+      (move-memory! io-buf (slot-value port 'data) to-write start p)
       
       ;; 2. Update cursor
       (set! (slot-value port 'offset) (+ p to-write))
@@ -580,11 +608,15 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           0))))
 
 
-(define-method (peek! (port <buffered-input-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((buf-mgr    (slot-value port 'buffer))
+(define-method (peek! (port <buffered-input-port>) target #!optional (start 0) (count #f))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (buf-mgr    (slot-value port 'buffer))
          (raw-buffer (slot-value port 'raw-buffer))
          (capacity   (get-buffer-capacity buf-mgr))
-         (requested  (or count (- (u8vector-length bytevector) start))))
+         (requested  (or count (- io-len start))))
 
     (when (> requested capacity)
       (error "peek! request exceeds buffer capacity" requested capacity))
@@ -599,7 +631,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
       ;; 2. CACHE HIT: The data is now hopefully in the buffer's window
       ;; Just delegate the actual copy-out to the buffer's peek! method.
-      (peek! buf-mgr bytevector start requested))))
+      (peek! buf-mgr target start requested))))
   
 (define-method (read-byte! (port <buffered-input-port>))
   (let* ((buffer (slot-value port 'buffer))
@@ -808,8 +840,12 @@ The write! procedure writes up to count bytes from bytevector starting at index 
            
            ;; 7: read-string! (The optimized block-read hook)
            ;; CHICKEN passes: (port dest-string count)
-           (lambda (p dest n) 
-             (read! coops-obj dest 0 n))
+           (lambda (port count target offset) 
+             (read!
+			  coops-obj
+			  target
+			  offset
+			  count))
            
            ;; 8: read-line (We let CHICKEN use its default logic)
            #f))                                     

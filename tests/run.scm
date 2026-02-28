@@ -2,8 +2,12 @@
         coops 
         srfi-4
 		srfi-1
-        (chicken base) 
-        (chicken port) 
+		utf8
+        (chicken base)
+		(chicken locative)
+		(chicken foreign)
+        (chicken port)
+		(chicken blob)
         (chicken memory)
 		(chicken file)
         (chicken condition)
@@ -15,6 +19,12 @@
 		coops-port)
 
 (define random pseudo-random-integer)
+
+(define (string->utf8 str)
+  (blob->u8vector (string->blob str)))
+
+(define (u8vector->string bv)
+  (blob->string (u8vector->blob bv)))
 
 (define large-data (make-u8vector 5000))
 
@@ -472,7 +482,7 @@
   
   ;; 2. TEST: Buffered Input -> High-level Peek/Read
   (test-group "Buffered Decorator Bridge"
-    (let* ((data (string->u8vector "0123456789ABCDEF"))
+    (let* ((data (string->utf8 "0123456789ABCDEF"))
            (source (make-bytevector-input-port data))
            (b-port (make-buffered-input-port source 8)) ;; 8 byte buffer
            (c-handle (coops-port->chicken-port b-port)))
@@ -501,7 +511,7 @@
   
   ;; 4. TEST: Complex Interop (Chicken's copy-port)
   (test-group "The copy-port Interop"
-    (let* ((src-data (string->u8vector "The quick brown fox"))
+    (let* ((src-data (string->utf8 "The quick brown fox"))
            (in-coops (make-bytevector-input-port src-data))
            (out-coops (make-bytevector-dynamic-output-port))
            (in-handle (coops-port->chicken-port in-coops))
@@ -511,6 +521,35 @@
       (copy-port in-handle out-handle)
       
       (test "Full copy success" "The quick brown fox" 
-            (u8vector->string (get-output-u8vector out-coops)))))))
+            (u8vector->string (get-output-u8vector out-coops))))))
+
+
+(test-group "The Zero-Copy Magic Test"
+  (let* ((source-data (u8vector 65 66 67 68 69)) 
+         (port (make-bytevector-input-port source-data))
+         (target-str (make-string 5 #\.)))
+    
+    (read! port target-str 0 5)
+    
+    (test "String is now ABCDE" "ABCDE" target-str)
+    
+    ;; Create alias NOW. If this works, it proves we didn't need 
+    ;; to manually update the string; the bytes were just there.
+    (let ((alias (blob->u8vector (string->blob target-str))))
+      (test "Alias reflects new bytes" 
+            '(65 66 67 68 69) 
+            (u8vector->list alias)))))
+
+(test-group "The Zero-Copy Blob Test"
+  (let* ((source-data (u8vector 72 105 33)) ;; "Hi!"
+         (port (make-bytevector-input-port source-data))
+         (target-blob (make-blob 3)))
+
+    (read! port target-blob 0 3)
+    
+    (test "Alias reflected blob update" 
+          '(72 105 33) 
+          (u8vector->list (blob->u8vector target-blob)))
+	))
 
 (test-end "Coop-Ports")
