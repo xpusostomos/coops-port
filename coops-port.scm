@@ -823,7 +823,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     c-port))
 
 (define (chicken-port->coops-port c-port)
-  (if (##sys#port? c-port)
+  (if (port? c-port)
       (let ((data (##sys#port-data c-port))) 
         (if (and (vector? data) (>= (vector-length data) 2))
             (##sys#slot data 1) ;; Extract from the 2nd slot of the data vector
