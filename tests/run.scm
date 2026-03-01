@@ -748,4 +748,85 @@
         (test "Input port closed" #t (closed? p-in))
         (test "Output port closed" #t (closed? p-out))))))
 
+(define (run-io-stress-test port-gen ops-count)
+  (let* ((port (port-gen))
+         (ref-buffer (make-u8vector 10000 0)) ;; Our "ground truth"
+         (ref-size 0)
+         (ref-pos 0))
+    (do ((i 0 (+ i 1)))
+        ((= i ops-count))
+      (let ((op (pseudo-random-integer 3)))
+        (cond
+         ;; OP 0: Write Data
+         ((= op 0)
+          (let* ((count (+ 1 (pseudo-random-integer 64)))
+                 (data (make-u8vector count)))
+            ;; Fill with pattern
+            (do ((j 0 (+ j 1))) ((= j count)) 
+              (u8vector-set! data j (pseudo-random-integer 256)))
+            (write! port data 0 count)
+            ;; Update reference
+            (move-memory! data ref-buffer count 0 ref-pos)
+            (set! ref-pos (+ ref-pos count))
+            (set! ref-size (max ref-size ref-pos))))
+
+         ;; OP 1: Seek to random existing point
+         ((= op 1)
+          (let ((target (pseudo-random-integer (max 1 ref-size))))
+            (set-position! port target)
+            (set! ref-pos target)))
+
+         ;; OP 2: Read and Compare
+         ((= op 2)
+          (let* ((avail (- ref-size ref-pos))
+                 (count (if (<= avail 0) 0 (+ 1 (pseudo-random-integer (min 64 avail))))))
+            (when (> count 0)
+              (let ((buf (make-u8vector count 0)))
+                (read! port buf 0 count)
+                (do ((j 0 (+ j 1))) ((= j count))
+                  (unless (= (u8vector-ref buf j) (u8vector-ref ref-buffer (+ ref-pos j)))
+                    (error "IO-Stress: Read mismatch at pos" (+ ref-pos j))))
+                (set! ref-pos (+ ref-pos count)))))))))
+    (close port)
+    #t))
+
+(test-group "14. Input-Output (Duplex) Ports"
+
+  (test-group "14.1 Bytevector Duplex"
+    (let* ((data (make-u8vector 100 0))
+           (port (make-bytevector-input-output-port data)))
+      (write! port (string->utf8 "Hello"))
+      (set-position! port 0)
+      (let ((buf (make-u8vector 5)))
+        (read! port buf 0 5)
+        (test "Read back from BV-IO" "Hello" (u8vector->string buf)))))
+
+  (test-group "14.2 File Duplex (R/W mode)"
+    (let* ((fn "duplex_test.bin")
+           (port (make-file-input-output-port fn (bitwise-ior open/read-write open/create open/truncate))))
+      (write! port (u8vector 10 20 30 40))
+      (set-position! port 1)
+      (test "File IO Read at offset" 20 (read-byte! port))
+      (write-byte! port 99) ;; Overwrite position 2 (where 30 was)
+      (set-position! port 2)
+      (test "File IO Verification of overwrite" 99 (read-byte! port))
+      (close port)
+      (when (file-exists? fn) (delete-file fn))))
+
+  (test-group "14.3 Polymorphic IO Stress"
+    (test "Bytevector IO Stress" #t
+          (run-io-stress-test 
+            (lambda () (make-bytevector-input-output-port (make-u8vector 20000 0))) 
+            1000))
+    
+    (test "File IO Stress" #t
+          (let ((fn "io_stress.bin"))
+            (let ((res (run-io-stress-test 
+                        (lambda () (make-file-input-output-port fn (bitwise-ior open/read-write open/create open/truncate))) 
+                        500)))
+              (when (file-exists? fn) (delete-file fn))
+              res)))))
+
+
+
 (test-end "Coop-Ports")

@@ -19,6 +19,7 @@
      make-bytevector-input-port
      make-bytevector-output-port
      make-bytevector-dynamic-output-port
+	 make-bytevector-input-output-port
      reset-input-data!
      truncate!
      get-output-u8vector
@@ -32,6 +33,7 @@
      make-posix-output-port
      make-file-input-port
      make-file-output-port
+	 make-file-input-output-port
 
      ;; --- Buffered Decorators ---
      <buffered-port> <buffered-input-port> <buffered-output-port>
@@ -105,6 +107,8 @@ If position is not an integer, whence is ignored and the stream is restored stat
   0)
 
 (define-class <output-port> (<port>))
+
+(define-class <input-output-port> (<input-port> <output-port>))
 
 (define-generic (flush! <port>))
 
@@ -270,8 +274,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (get-position port)))
 
 
-(define-class <bytevector-output-port> (<binary-output-port> <bytevector-port>)
-  )
+(define-class <bytevector-output-port> (<binary-output-port> <bytevector-port>))
 
 (define (make-bytevector-output-port data #!optional (start 0) (count #f))
   (let* ((data-len (u8vector-length data))
@@ -345,7 +348,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 
 (define-class <bytevector-dynamic-output-port> (<bytevector-output-port>)
-  )
+  ((dynamic-growth-factor 2)))
 
 (define initial-buffer-capacity 32)
 
@@ -366,9 +369,10 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-generic (calculate-growth port requested-size))
 
+
 (define-method (calculate-growth (port <bytevector-dynamic-output-port>) req)
   ;; Default strategy: double the current capacity
-  (max req (* (u8vector-length (slot-value port 'data)) 2)))
+  (max req (* (u8vector-length (slot-value port 'data)) (slot-value port 'dynamic-growth-factor))))
 
 (define-method (ensure-capacity! (port <bytevector-dynamic-output-port>) req)
   (let* ((data (slot-value port 'data))
@@ -431,6 +435,22 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-method (get-data-length (port <bytevector-port>))
   (- (slot-value port 'size) (slot-value port 'start)))
+
+(define-class <bytevector-input-output-port> (<input-output-port> <bytevector-input-port> <bytevector-output-port>))
+
+(define (make-bytevector-input-output-port data #!optional (start 0) (count #f) (limit #f))
+  (let* ((data-len (u8vector-length data))
+         (actual-limit (or limit (- data-len start)))
+         (actual-count (or count (- data-len start)))
+         (size (+ start actual-count))
+		 (nlimit (+ start actual-limit)))
+    (make <bytevector-input-output-port> 
+      'data  data
+      'start start
+      'offset start
+      'size  size
+      'limit nlimit)))
+
 
 (define-class <buffered-port> (<output-port> <seekable-port>)
   ((source/sink)          ;; Any port-like object that implements write! and flush!
@@ -835,6 +855,18 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (if (negative? fd)
         (error "Could not open file raw" path/fd)
         (make <file-output-port> 'fd fd))))
+
+(define-class <file-input-output-port> (<file-input-port> <file-output-port> <input-output-port>))
+
+(define (make-file-input-output-port path/fd #!optional (flags (bitwise-ior open/read-write open/create)) (mode #o644))
+    @("For making a regular file into a port")
+  (let ((fd (if (integer? path/fd)
+				path/fd
+				(%posix-open% path/fd flags mode))))
+    (if (negative? fd)
+        (error "Could not open file raw" path/fd)
+        (make <file-input-output-port> 'fd fd))))
+
 
 
 (define-method (write! (port <posix-output-port>) target #!optional (start 0) (count #f))
