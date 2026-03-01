@@ -704,7 +704,7 @@
             (let ((res (test-input-bridge-polymorphic 
                          (lambda (_) (make-buffered-input-port (make-file-input-port fn) 128)) 
                          data 3000)))
-              ;; (when (file-exists? fn) (delete-file fn))
+              (when (file-exists? fn) (delete-file fn))
               res)))
 
     (test-group "Output Bridge Targets"
@@ -724,7 +724,34 @@
               (let ((res (test-output-bridge-polymorphic 
                            (lambda () (make-buffered-output-port (make-file-output-port fn (bitwise-ior open/read-write open/create open/truncate)) 256)) 
                            2000)))
-                ;; (when (file-exists? fn) (delete-file fn))
+                (when (file-exists? fn) (delete-file fn))
                 res))))))
+
+(test-group "13. Non-Seekable POSIX Ports (Pipes)"
+  (receive (in-fd out-fd) (pipe)
+    (let ((p-in  (make-posix-input-port in-fd))
+          (p-out (make-posix-output-port out-fd))
+          (test-msg (string->utf8 "Pipe data"))
+          (target (make-u8vector 20 0)))
+
+      (test-group "13.1 Basic Pipe I/O"
+        (test "Write to posix-output-port" 9 (write! p-out test-msg))
+        ;; We don't need to flush pipes, but let's ensure it doesn't crash
+        (test "Flush is no-op" (void) (flush! p-out))
+        
+        (test "Read from posix-input-port" 9 (read! p-in target 0 9))
+        (test "Data integrity" "Pipe data" (u8vector->string (subu8vector target 0 9))))
+
+      (test-group "13.2 Non-Seekable Constraints"
+        ;; These should return #f or error based on your <port> implementation 
+        ;; because <posix-port> does NOT inherit from <seekable-port>
+        (test "get-position returns #f for non-seekable" #f (get-position p-in))
+        (test "available returns 0 or uses FIONREAD" 0 (available p-in)))
+
+      (test-group "13.3 Cleanup"
+        (close p-in)
+        (close p-out)
+        (test "Input port closed" #t (closed? p-in))
+        (test "Output port closed" #t (closed? p-out))))))
 
 (test-end "Coop-Ports")

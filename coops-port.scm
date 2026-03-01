@@ -53,6 +53,8 @@
 	(port "port")
 	(@to "undefined")))
 
+(define-class <seekable-port> (<port>))
+
 (define-method (close (port <port>))
   (void))
 
@@ -72,8 +74,8 @@ this feature, it returns #f"
 	(port "port")
 	(@to "number or object or #f")))
 
-(define-method (get-position (port <port>))
-  #f)
+(define-method (get-position (port <seekable-port>))
+  (error "get-position not implemented"))
 
 (define whence/beginning (foreign-value "SEEK_SET" int))
 (define whence/current (foreign-value "SEEK_CUR" int))
@@ -87,8 +89,8 @@ this feature, it returns #f"
 If position is not an integer, whence is ignored and the stream is restored state represented by the opaque object.")
 	(@to "#f if unsupported by this stream")))
 
-(define-method (set-position! (port <port>) position #!optional (whence whence/beginning))
-  #f)
+(define-method (set-position! (port <seekable-port>) position #!optional (whence whence/beginning))
+  (error "set-position! not implemented"))
 
 (define-class <input-port> (<port>))
 
@@ -162,7 +164,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
     (void)))
 
 
-(define-class <bytevector-port> (<binary-port>)
+(define-class <bytevector-port> (<binary-port> <seekable-port>)
   ((start initform: 0)
    (offset initform: 0)
    (size initform: 0)
@@ -428,7 +430,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define-method (get-data-length (port <bytevector-port>))
   (- (slot-value port 'size) (slot-value port 'start)))
 
-(define-class <buffered-port> (<output-port>)
+(define-class <buffered-port> (<output-port> <seekable-port>)
   ((source/sink)          ;; Any port-like object that implements write! and flush!
    (buffer)        ;; The <bytevector-fixed-output-port> logic manager
    (raw-buffer)))  ;; The physical u8vector backing the buffer
@@ -672,37 +674,56 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define open/append @("Always appends to the file") (foreign-value "O_APPEND" int))
 
 
-(define-class <file-port> (<binary-port>)
+(define-class <posix-port> (<binary-port>)
   ((fd initform: -1)))
+
+(define-class <posix-input-port> (<posix-port> <binary-input-port>))
+
+(define-class <posix-output-port> (<posix-port> <binary-output-port>))
+
+
+(define-class <file-port> (<posix-port> <seekable-port>))
 
 (define-method (initialize-instance (port <file-port>))
   (call-next-method)
   ;; Register the generic 'close' for this specific instance
   (set-finalizer! port close))
 
-(define-method (closed? (port <file-port>))
-  (< (slot-value port 'fd) 0))
-
-(define-method (close (port <file-port>))
+(define-method (closed? (port <posix-port>))
   (let ((fd (slot-value port 'fd)))
-    (when (>= fd 0)
+	(or (not fd) (< fd 0))))
+
+(define-method (confirm-open (port <posix-port>))
+  (if (closed? port)
+      (error "posix file is closed")))
+
+(define-method (close (port <posix-port>))
+  (let ((fd (slot-value port 'fd)))
+    (when fd
       (%posix-close% fd)
-      (set! (slot-value port 'fd) -1)
+      (set! (slot-value port 'fd) #f)
 	  (set-finalizer! port (lambda (p) (void))))))
 
 (define-method (set-position! (port <file-port>) position #!optional (whence whence/beginning))
+  (confirm-open port)
   (let* ((fd (slot-value port 'fd))
          (new-pos (%posix-lseek% fd position whence)))
-    (if (negative? new-pos) #f new-pos)))
+    (if (negative? new-pos)
+		(error "set-position! failed to lseek")
+		new-pos)))
 
 (define-method (get-position (port <file-port>))
+  (confirm-open port)
   (let* ((fd (slot-value port 'fd))
          (new-pos (%posix-lseek% fd 0 whence/current)))
-    (if (negative? new-pos) #f new-pos)))
+    (if (negative? new-pos)
+		(error "get-position failed to lseek")
+		new-pos)))
 
 (define-generic (sync! port))
 
 (define-method (sync! (port <file-port>) #!optional (data-only? #f))
+  (confirm-open port)
   (let ((fd (slot-value port 'fd)))
     (if (>= fd 0)
         (let* ((sync-fn (if data-only? %posix-fdatasync% %posix-fsync%))
@@ -712,10 +733,18 @@ The write! procedure writes up to count bytes from bytevector starting at index 
               result))
         (void)))) ;; Silently succeed if already closed
 
-(define-class <file-input-port> (<binary-input-port> <file-port>)
-  )
+(define-class <file-input-port> (<file-port> <posix-input-port> <binary-input-port>))
+
+(define (make-posix-input-port fd)
+  @("For making a non-seekable (socket) fd into a port")
+        (make <posix-input-port> 'fd fd))
+
+(define (make-posix-output-port fd)
+  @("For making a non-seekable (socket) fd into a port")
+        (make <posix-output-port> 'fd fd))
 
 (define (make-file-input-port path/fd #!optional (flags open/read) (mode #o644))
+    @("For making a regular file into a port")
   (let ((fd (if (integer? path/fd)
 				path/fd
 				(%posix-open% path/fd flags mode))))
@@ -725,6 +754,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (make <file-input-port> 'fd fd))))
 
 (define-method (read! (port <file-input-port>) target #!optional (start 0) (count #f))
+  (confirm-open port)
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
@@ -779,8 +809,11 @@ The write! procedure writes up to count bytes from bytevector starting at index 
      C_return(count);"))
 
 (define-method (get-data-length (port <file-port>))
+  (confirm-open port)
   (let ((size (%posix-fstat-size% (slot-value port 'fd))))
-    (if (negative? size) 0 size)))
+    (if (negative? size)
+		(error "get-data-length failed fstat")
+		size)))
 
 (define-method (available (port <file-input-port>))
   (let ((total (get-data-length port))
@@ -790,10 +823,10 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         0)))
 
 
-(define-class <file-output-port> (<binary-output-port> <file-port>)
-  )
+(define-class <file-output-port> (<file-port> <posix-output-port> <binary-output-port>))
 
 (define (make-file-output-port path/fd #!optional (flags (bitwise-ior open/write open/create open/truncate)) (mode #o644))
+    @("For making a regular file into a port")
   (let ((fd (if (integer? path/fd)
 				path/fd
 				(%posix-open% path/fd flags mode))))
@@ -803,6 +836,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 
 (define-method (write! (port <file-output-port>) target #!optional (start 0) (count #f))
+  (confirm-open port)
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
