@@ -725,11 +725,15 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (make <file-input-port> 'fd fd))))
 
 (define-method (read! (port <file-input-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((fd (slot-value port 'fd))
-         (requested (or count (- (u8vector-length bytevector) start)))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (io-buf (make-locative target start))
+		 (fd (slot-value port 'fd))
+         (requested (or count (- io-len start)))
          ;; We must use a locative so the FFI 'c-pointer' type gets a raw address
-         (ptr (make-locative bytevector start))
-         (result (%posix-read% fd ptr requested)))
+         (result (%posix-read% fd io-buf requested)))
     (if (negative? result)
         (error "file-read error" result)
         result)))
@@ -797,7 +801,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
                            (else (error "read! target must be u8vector, string, or blob" target))))
-		 (io-buf (make-locative target))
+		 (io-buf (make-locative target start))
 		 (fd (slot-value port 'fd))
          (requested (or count (- io-len start)))
          ;; Same here: c-pointer requires a locative or raw pointer
