@@ -2,8 +2,10 @@
         coops 
         srfi-4
 		srfi-1
-		utf8
+		srfi-170
+		;; utf8
         (chicken base)
+		(chicken file posix)
 		(chicken locative)
 		(chicken foreign)
         (chicken port)
@@ -551,5 +553,178 @@
           '(72 105 33) 
           (u8vector->list (blob->u8vector target-blob)))
 	))
+
+(define (get-coops-port-content obj)
+  ;; (if (subclass? (class-of obj) <buffered-port>)
+  ;; 	  (flush! obj))
+  (cond
+   ;; 1. If it's a decorator, recurse into the underlying port
+    ((subclass? (class-of obj) <buffered-port>) 
+     (get-coops-port-content (slot-value obj 'source/sink)))
+    
+    ;; 2. If it's a memory-backed port, extract the active slice
+    ((subclass? (class-of obj) <bytevector-port>) 
+     (let ((data (slot-value obj 'data))
+           (start (slot-value obj 'start))
+           (offset (slot-value obj 'offset)))
+       (subu8vector data start (+ start offset))))
+    
+    ;; 3. If it's a file, read the current content back from disk
+
+	((subclass? (class-of obj) <file-port>)
+	 (sync! obj)
+	 (let* ((fd (slot-value obj 'fd))
+			(saved-pos (get-position obj))
+			;; Ground truth: use the current cursor as the size
+			(actual-size saved-pos) 
+			;; Create a BLOB (not a u8vector) to satisfy file-read
+			(target-blob (make-blob actual-size)))
+	   (set-file-position! fd 0 whence/beginning)
+	   ;; file-read returns (list buffer bytes-read)
+	   (file-read fd actual-size target-blob)
+	   (set-file-position! fd saved-pos whence/beginning) 
+	   ;; Convert the mutated blob back to a u8vector for your test
+	   (blob->u8vector target-blob)))
+	 
+    (else #f)))
+
+(define (test-input-bridge-polymorphic port-gen source-data iterations)
+  (let* ((coops-obj (port-gen source-data))
+         (c-port    (coops-port->chicken-port coops-obj))
+         (data-len  (u8vector-length source-data))
+         (ref-pos   0))
+    (do ((i 0 (+ i 1)))
+        ((= i iterations))
+      (let ((op (pseudo-random-integer 3)))
+        (cond
+         ((= op 0) (let ((c (read-char c-port))) 
+                     (unless (eof-object? c) (set! ref-pos (+ ref-pos 1)))))
+         ((= op 1) (let* ((n (min 32 (- data-len ref-pos)))
+                          (buf (make-string n))
+                          (read (read-string! n buf c-port)))
+                     (set! ref-pos (+ ref-pos read))))
+         ((= op 2) (peek-char c-port)))))
+    (let ((final-pos (get-position coops-obj)))
+      (close-input-port c-port)
+      (= final-pos ref-pos))))
+
+(define (test-output-bridge-polymorphic port-gen size)
+  (let* ((coops-obj (port-gen))
+         (c-port    (coops-port->chicken-port coops-obj)))
+    (do ((i 0 (+ i 1)))
+        ((= i size))
+      (write-char #\A c-port))
+    (flush-output c-port)
+    (let ((content (get-coops-port-content coops-obj)))
+      (close-output-port c-port)
+      (and (u8vector? content)
+           (= (u8vector-length content) size)
+           (every (lambda (b) (= b 65)) (u8vector->list content))))))
+
+
+(test-group "Bridge: copy-port Interop Stress"
+  (let* ((size (* 1024 50)) ;; 50KB
+         (raw-in (list->u8vector (map (lambda (x) (pseudo-random-integer 256)) (make-list size))))
+         (src-coops (make-bytevector-input-port raw-in))
+         (dst-coops (make-bytevector-dynamic-output-port))
+         (src-chicken (coops-port->chicken-port src-coops))
+         (dst-chicken (coops-port->chicken-port dst-coops)))
+    
+    ;; This triggers Hook 7 on src and Hook 3 on dst repeatedly
+    (copy-port src-chicken dst-chicken)
+    
+    (let ((result (get-output-u8vector dst-coops)))
+      (test "Copy-port total length" size (u8vector-length result))
+      (test "Copy-port integrity" (u8vector->list raw-in) (u8vector->list result)))
+    
+    (close-input-port src-chicken)
+    (close-output-port dst-chicken)))
+
+  (test-group "Bridge: Boundary Conditions"
+  
+  (test-group "Exact Buffer Match"
+    (let* ((data (u8vector 49 50 51 52))
+           (in (coops-port->chicken-port (make-bytevector-input-port data)))
+           (buf (make-string 4)))
+      ;; Should fill exactly 4 bytes
+      (test "Read exact size" 4 (read-string! 4 buf in))
+	  (test "Content match" '(49 50 51 52) (map char->integer (string->list buf)))))
+  
+  (test-group "Over-read Handling"
+    (let* ((data (u8vector 65 66)) ;; "AB"
+           (in (coops-port->chicken-port (make-bytevector-input-port data)))
+           (buf (make-string 10 #\.)))
+      ;; User asks for 10, but only 2 exist.
+      (test "Short read-string!" 2 (read-string! 10 buf in))
+      (test "Buffer partially mutated" "AB........" buf)))
+
+  (test-group "Zero-length Ops"
+    (let* ((in (coops-port->chicken-port (make-bytevector-input-port (u8vector 1 2 3)))))
+      (test "Zero read-string!" 0 (read-string! 0 (make-string 5) in))
+      (test "Position unchanged after zero-read" 0 (get-position (chicken-port->coops-port in))))))
+
+(test-group "Bridge: UTF-8 Binary Integrity"
+  (let* ((utf8-str "λ is a Greek letter")
+         (raw-bytes (string->blob utf8-str))
+         (in-coops (make-bytevector-input-port (blob->u8vector raw-bytes)))
+         (in-chicken (coops-port->chicken-port in-coops)))
+    
+    ;; read-line in CHICKEN is locale-aware but handles standard binary strings
+    (test "UTF-8 Roundtrip via Bridge" 
+          utf8-str 
+          (read-line in-chicken))
+    (close-input-port in-chicken)))
+
+(test-group "Final Bridge Torture Test (Polymorphic Composition)"
+  
+  (let ((data (make-u8vector 2000))
+        (fn "bridge_stress.bin"))
+    ;; Fill with a predictable pattern
+    (do ((i 0 (+ i 1))) ((= i 2000)) (u8vector-set! data i (modulo i 256)))
+
+    (test-group "Input Bridge Targets"
+      ;; 1. Raw Bytevector
+      (test "Raw Bytevector" #t 
+            (test-input-bridge-polymorphic make-bytevector-input-port data 3000))
+      
+      ;; 2. Buffered Bytevector
+      (test "Buffered Bytevector" #t 
+            (test-input-bridge-polymorphic 
+              (lambda (d) (make-buffered-input-port (make-bytevector-input-port d) 64)) 
+              data 3000))
+      
+      ;; 3. Raw File Port
+      (test "Raw File Port" #t 
+            (begin
+              (with-output-to-file fn (lambda () (display (u8vector->string data))))
+              (test-input-bridge-polymorphic (lambda (_) (make-file-input-port fn)) data 3000)))
+
+      ;; 4. Buffered File Port (Full Composition)
+      (test "Buffered File Port" #t 
+            (let ((res (test-input-bridge-polymorphic 
+                         (lambda (_) (make-buffered-input-port (make-file-input-port fn) 128)) 
+                         data 3000)))
+              ;; (when (file-exists? fn) (delete-file fn))
+              res)))
+
+    (test-group "Output Bridge Targets"
+      ;; 1. Raw Dynamic
+      (test "Dynamic Output" #t 
+            (test-output-bridge-polymorphic make-bytevector-dynamic-output-port 2000))
+      
+      ;; 2. Buffered Dynamic
+      (test "Buffered Dynamic" #t 
+            (test-output-bridge-polymorphic 
+              (lambda () (make-buffered-output-port (make-bytevector-dynamic-output-port) 64)) 
+              2000))
+      
+      ;; 3. Buffered File Output
+      (test "Buffered File Output" #t 
+            (begin
+              (let ((res (test-output-bridge-polymorphic 
+                           (lambda () (make-buffered-output-port (make-file-output-port fn (bitwise-ior open/read-write open/create open/truncate)) 256)) 
+                           2000)))
+                ;; (when (file-exists? fn) (delete-file fn))
+                res))))))
 
 (test-end "Coop-Ports")

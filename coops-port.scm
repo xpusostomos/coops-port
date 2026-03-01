@@ -192,12 +192,10 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-method (read! (port <bytevector-input-port>) target #!optional (start 0) (count #f))
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
-						   ((integer? target) target)
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
                            (else (error "read! target must be u8vector, string, or blob" target))))
 		 (io-buf (cond ((u8vector? target) target)
-					   ((integer? target) (make-u8vector target 0))
                        (else (make-locative target))))
 		 (data (slot-value port 'data))
          (offset (slot-value port 'offset))
@@ -237,12 +235,10 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-method (peek! (port <bytevector-input-port>) target #!optional (start 0) (count #f))
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
-						   ((integer? target) target)
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
                            (else (error "read! target must be u8vector, string, or blob" target))))
 		 (io-buf (cond ((u8vector? target) target)
-					   ((integer? target) (make-u8vector target 0))
                        (else (make-locative target))))
 		 (data      (slot-value port 'data))
          (offset    (slot-value port 'offset))
@@ -286,12 +282,10 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-method (write! (port <bytevector-output-port>) target #!optional (start 0) (count #f))
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
-						   ((integer? target) target)
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
                            (else (error "read! target must be u8vector, string, or blob" target))))
 		 (io-buf (cond ((u8vector? target) target)
-					   ((integer? target) (make-u8vector target 0))
                        (else (make-locative target))))
 		 (requested (or count (- io-len start)))
          (p (slot-value port 'offset)))
@@ -721,11 +715,13 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define-class <file-input-port> (<binary-input-port> <file-port>)
   )
 
-(define (make-file-input-port path #!optional (flags open/read) (mode #o644))
-  (let ((fd (%posix-open% path flags mode)))
+(define (make-file-input-port path/fd #!optional (flags open/read) (mode #o644))
+  (let ((fd (if (integer? path/fd)
+				path/fd
+				(%posix-open% path/fd flags mode))))
     (if (negative? fd)
         (begin 
-          (error "Could not open file raw" path))
+          (error "Could not open file raw" path/fd))
         (make <file-input-port> 'fd fd))))
 
 (define-method (read! (port <file-input-port>) bytevector #!optional (start 0) (count #f))
@@ -738,6 +734,11 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (error "file-read error" result)
         result)))
 
+(define-method (peek-byte! (port <file-input-port>))
+  (let ((b (read-byte! port)))
+    (unless (eof-object? b)
+      (set-position! port -1 whence/current))
+    b))
 
 (define-method (get-position (port <buffered-input-port>))
   (let* ((source (slot-value port 'source/sink))
@@ -782,19 +783,26 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 (define-class <file-output-port> (<binary-output-port> <file-port>)
   )
 
-(define (make-file-output-port path #!optional (flags (bitwise-ior open/write open/create open/truncate)) (mode #o644))
-  (let ((fd (%posix-open% path flags mode)))
+(define (make-file-output-port path/fd #!optional (flags (bitwise-ior open/write open/create open/truncate)) (mode #o644))
+  (let ((fd (if (integer? path/fd)
+				path/fd
+				(%posix-open% path/fd flags mode))))
     (if (negative? fd)
-        (error "Could not open file raw" path)
+        (error "Could not open file raw" path/fd)
         (make <file-output-port> 'fd fd))))
 
 
-(define-method (write! (port <file-output-port>) bytevector #!optional (start 0) (count #f))
-  (let* ((fd (slot-value port 'fd))
-         (requested (or count (- (u8vector-length bytevector) start)))
+(define-method (write! (port <file-output-port>) target #!optional (start 0) (count #f))
+  (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
+                           ((string? target)   (string-length target))
+                           ((blob? target)     (blob-size target)) ;; Blobs use 'size'
+                           (else (error "read! target must be u8vector, string, or blob" target))))
+		 (io-buf (make-locative target))
+		 (fd (slot-value port 'fd))
+         (requested (or count (- io-len start)))
          ;; Same here: c-pointer requires a locative or raw pointer
-         (ptr (make-locative bytevector start))
-         (result (%posix-write% fd ptr requested)))
+         ;; (ptr (make-locative bytevector start))
+         (result (%posix-write% fd io-buf requested)))
     (if (negative? result)
         (error "file-write error" result)
         result)))
