@@ -724,7 +724,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           (error "Could not open file raw" path/fd))
         (make <file-input-port> 'fd fd))))
 
-(define-method (read! (port <file-input-port>) bytevector #!optional (start 0) (count #f))
+(define-method (read! (port <file-input-port>) target #!optional (start 0) (count #f))
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
                            ((string? target)   (string-length target))
                            ((blob? target)     (blob-size target)) ;; Blobs use 'size'
