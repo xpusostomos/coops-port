@@ -28,6 +28,8 @@
 
      ;; --- Raw File Port Implementation ---
      <file-port> <file-input-port> <file-output-port>
+     make-posix-input-port
+     make-posix-output-port
      make-file-input-port
      make-file-output-port
 
@@ -684,7 +686,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
 
 (define-class <file-port> (<posix-port> <seekable-port>))
 
-(define-method (initialize-instance (port <file-port>))
+(define-method (initialize-instance (port <posix-port>))
   (call-next-method)
   ;; Register the generic 'close' for this specific instance
   (set-finalizer! port close))
@@ -753,7 +755,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
           (error "Could not open file raw" path/fd))
         (make <file-input-port> 'fd fd))))
 
-(define-method (read! (port <file-input-port>) target #!optional (start 0) (count #f))
+(define-method (read! (port <posix-input-port>) target #!optional (start 0) (count #f))
   (confirm-open port)
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
                            ((string? target)   (string-length target))
@@ -769,12 +771,12 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         result)))
 
 
-(define-method (peek! (port <file-input-port>) target #!optional (start 0) (count #f))
+(define-method (peek! (port <posix-input-port>) target #!optional (start 0) (count #f))
   (let* ((sz (read! port target start count)))
     (set-position! port (- sz) whence/current)
 	sz))
 
-(define-method (peek-byte! (port <file-input-port>))
+(define-method (peek-byte! (port <posix-input-port>))
   (let ((b (read-byte! port)))
     (unless (eof-object? b)
       (set-position! port -1 whence/current))
@@ -835,7 +837,7 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (make <file-output-port> 'fd fd))))
 
 
-(define-method (write! (port <file-output-port>) target #!optional (start 0) (count #f))
+(define-method (write! (port <posix-output-port>) target #!optional (start 0) (count #f))
   (confirm-open port)
   (let* ((io-len (cond ((u8vector? target) (u8vector-length target))
                            ((string? target)   (string-length target))

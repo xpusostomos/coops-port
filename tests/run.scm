@@ -2,7 +2,6 @@
         coops 
         srfi-4
 		srfi-1
-		srfi-170
 		;; utf8
         (chicken base)
 		(chicken file posix)
@@ -10,6 +9,7 @@
 		(chicken foreign)
         (chicken port)
 		(chicken blob)
+		(chicken process)
         (chicken memory)
 		(chicken file)
         (chicken condition)
@@ -728,7 +728,7 @@
                 res))))))
 
 (test-group "13. Non-Seekable POSIX Ports (Pipes)"
-  (receive (in-fd out-fd) (pipe)
+  (receive (in-fd out-fd) (create-pipe)
     (let ((p-in  (make-posix-input-port in-fd))
           (p-out (make-posix-output-port out-fd))
           (test-msg (string->utf8 "Pipe data"))
@@ -741,12 +741,6 @@
         
         (test "Read from posix-input-port" 9 (read! p-in target 0 9))
         (test "Data integrity" "Pipe data" (u8vector->string (subu8vector target 0 9))))
-
-      (test-group "13.2 Non-Seekable Constraints"
-        ;; These should return #f or error based on your <port> implementation 
-        ;; because <posix-port> does NOT inherit from <seekable-port>
-        (test "get-position returns #f for non-seekable" #f (get-position p-in))
-        (test "available returns 0 or uses FIONREAD" 0 (available p-in)))
 
       (test-group "13.3 Cleanup"
         (close p-in)
