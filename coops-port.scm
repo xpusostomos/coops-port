@@ -738,6 +738,12 @@ The write! procedure writes up to count bytes from bytevector starting at index 
         (error "file-read error" result)
         result)))
 
+
+(define-method (peek! (port <file-input-port>) target #!optional (start 0) (count #f))
+  (let* ((sz (read! port target start count)))
+    (set-position! port (- sz) whence/current)
+	sz))
+
 (define-method (peek-byte! (port <file-input-port>))
   (let ((b (read-byte! port)))
     (unless (eof-object? b)
